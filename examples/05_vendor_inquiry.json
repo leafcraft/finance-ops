@@ -1,0 +1,14 @@
+{
+  "_entry_point": "vendor_inquiry",
+  "_description": "Vendor emails AP asking 'Where is my payment for INV-ACS-2026-0042?' — routes to vendor_comms_agent (inquiry_response mode) which checks status + drafts a response.",
+  "payload": {
+    "source": "vendor_email",
+    "from_address": "billing@acmecloud.example",
+    "vendor_id": "v-acme-cloud-001",
+    "vendor_name": "Acme Cloud Services Inc.",
+    "subject": "Re: Outstanding Invoice INV-ACS-2026-0042",
+    "body_text": "Hello AP team,\n\nI'm following up on our invoice INV-ACS-2026-0042 dated 2026-06-01 for $4,200 (June subscription renewal). The payment terms are Net30 so it should be due by 2026-07-01. We have not received any confirmation that it's been scheduled. Could you let me know the expected pay date?\n\nThanks,\nLena (Acme Cloud Billing)",
+    "referenced_invoice_id": "INV-ACS-2026-0042",
+    "query_type": "payment_status"
+  }
+}

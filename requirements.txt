@@ -1,0 +1,11 @@
+# finance-ops — runtime dependencies
+#
+# leafmesh: SDK floor 2.4 — the human-gate routing (human_message
+# meta fields) and the audit sink registration (mesh.intelligence)
+# in this template require SDK 2.4+.
+leafmesh>=2.4.0
+
+# Scheduler (enables wake_up cron in YAML)
+apscheduler>=3.10.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
