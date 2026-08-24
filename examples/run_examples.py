@@ -17,8 +17,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Register the audit connector before SDK start
-import agency._shared.audit_logger  # noqa: F401
+# Register Ivy's @global_tool tools before SDK start (boot order matters).
+import agency.tools  # noqa: F401
+from agency._shared import audit_logger as _audit_logger
 
 from leafmesh import LeafMesh, LeafMeshLogger
 
@@ -28,9 +29,10 @@ EXAMPLES_DIR = Path(__file__).parent
 
 async def run_scenario(sdk: LeafMesh, scenario_path: Path) -> None:
     scenario = scenario_path.stem
-    payload = json.loads(scenario_path.read_text())
-    entry_point = payload.pop("_entry_point", "manual_action")
-    description = payload.pop("_description", "")
+    doc = json.loads(scenario_path.read_text())
+    entry_point = doc.get("_entry_point", "email_invoice")
+    description = doc.get("_description", "")
+    payload = doc.get("data", {})
     print()
     print("=" * 78)
     print(f"  SCENARIO: {scenario}")
@@ -66,6 +68,7 @@ async def main() -> int:
         return 1
 
     sdk = LeafMesh.from_yaml("configs/config.yaml")
+    _audit_logger.register(sdk, "audit_logger_agent")
     await sdk.start()
     try:
         for scenario_path in scenarios:

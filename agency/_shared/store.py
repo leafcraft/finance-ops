@@ -325,6 +325,60 @@ def sample_invoices() -> list[dict[str, Any]]:
     return list(_invoices().values())
 
 
+def find_invoice(ref: str) -> dict[str, Any]:
+    """Look up a seed invoice by source_event_id OR invoice_id. {} if unknown.
+
+    This is the day-0 stand-in for the email / portal / ERP read. In production
+    the body becomes the real connector call; the signature is the contract.
+    """
+    ref = str(ref or "").strip()
+    if not ref:
+        return {}
+    inv = _invoices().get(ref)
+    if inv:
+        return inv
+    for row in _invoices().values():
+        if str(row.get("invoice_id") or "") == ref:
+            return row
+    return {}
+
+
+# ── Backlog claim (the atomic claim behind Ivy's `instances` fan-out) ────────
+# Dev is single-process, so a threading lock guarding an in-memory claimed set
+# IS the atomic claim (each parallel instance pops a DISJOINT invoice). PROD:
+# swap the body for `LPOP count` on a Redis list, or `UPDATE ... FOR UPDATE SKIP
+# LOCKED RETURNING` on the ERP's unposted-invoice table — the contract (one
+# caller gets each item, exactly once) is unchanged.
+_CLAIMED: set[str] = set()
+
+
+def _open_backlog_ids() -> list[str]:
+    """source_event_ids of seed invoices not yet posted (the close-sweep backlog)."""
+    posted_ids = {r.get("invoice_id") for r in _posted().get("rows", [])}
+    return [eid for eid, inv in sorted(_invoices().items())
+            if inv.get("invoice_id") not in posted_ids]
+
+
+def claim_next_invoice() -> dict[str, Any]:
+    """Atomically claim ONE unclaimed backlog invoice. available:false when the
+    backlog is drained — never a synthetic 'here is an invoice' when there is
+    nothing to do (a claim on empty is a real, distinct outcome)."""
+    with _LOCK:
+        for eid in _open_backlog_ids():
+            if eid not in _CLAIMED:
+                _CLAIMED.add(eid)
+                inv = dict(_invoices().get(eid) or {})
+                inv["available"] = True
+                return inv
+    return {"available": False, "reason": "close-sweep backlog is empty (nothing left to claim)"}
+
+
+def reset_claims() -> None:
+    """Test/dev helper — clears the in-memory claim set."""
+    with _LOCK:
+        _CLAIMED.clear()
+
+
 # ── Posted ledger (the duplicate pre-flight source) ──────────────────
 def _posted() -> dict[str, Any]:
     s = _load("posted_ledger")

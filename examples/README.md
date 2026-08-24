@@ -1,8 +1,8 @@
 # finance-ops — example scenarios
 
-Five realistic AP scenarios that exercise the major paths through this
-mesh. Each file is a self-contained JSON payload that runs end-to-end
-via `mesh_call`.
+Five realistic scenarios that exercise the major paths through the pod. Each file
+is a self-contained JSON (`_entry_point` + `_description` + `data`) that runs
+end-to-end via `mesh_call` against the seed source store — no connector needed.
 
 ## How to run
 
@@ -10,54 +10,39 @@ via `mesh_call`.
 # All five scenarios in sequence:
 python examples/run_examples.py
 
-# One specific scenario:
-python examples/run_examples.py 01_happy_path
-python examples/run_examples.py vendor_inquiry   # any substring match works
+# One specific scenario (any substring match works):
+python examples/run_examples.py 02_duplicate
+python examples/run_examples.py close_sweep
 ```
 
-Each scenario prints its entry-point, the input description, and the
-result. Audit lines accumulate in `logs/audit.jsonl` — every line is
-hash-chained to the previous one, so a single `tail -f` of that file
-gives you the operational ledger across runs.
+Each scenario prints its entry point, the description, and the result. Audit
+lines accumulate in `logs/finance_audit.jsonl` — every line is hash-chained to
+the previous one, so a single `tail -f` gives you the operational ledger across
+runs.
 
 ## Scenario map
 
-| # | Scenario                          | Entry point      | Expected route                                                                            |
-|---|-----------------------------------|------------------|-------------------------------------------------------------------------------------------|
-| 1 | Happy-path subscription renewal   | `manual_entry`   | intake (normalize + extract) → matching (PO) → GL → approval-router → AP-clerk → ERP-poster → audit |
-| 2 | Fraud signal (round number, new vendor) | `manual_entry` | intake (normalize + extract) → **payment-risk** (dup pre-flight + fraud verdict) → controller-human (high-risk override) → audit |
-| 3 | PO mismatch — vendor over-billed  | `manual_entry`   | intake (normalize + extract) → **matching** (partial PO match) → vendor-comms (exception query) → vendor query → audit |
-| 4 | High-value CFO sign-off ($250K)   | `manual_entry`   | intake (normalize + extract) → GL → approval-router → **CFO-human + controller dual-sign** → ERP |
-| 5 | Vendor inquiry — "where's my pay?" | `vendor_inquiry` | vendor-comms (inquiry_response mode) → lookup status → drafts reply → audit             |
+| # | Scenario | Entry point | What it exercises |
+|---|---|---|---|
+| 1 | AP services invoice ($80K) | `email_invoice` | Ivy extract → Mat code → approval matrix routes to **CFO** (>= $50K) → Poe posts |
+| 2 | Duplicate re-submission | `email_invoice` | Ray's **dedupe floor** catches an already-posted invoice → forced controller review (not paid twice) |
+| 3 | 3-way quantity variance | `portal_invoice` | Mat's **3-way match floor** finds a short goods receipt → cross-check fails → bounded back-edge to Ivy → Lead |
+| 4 | "Where is this invoice?" | `invoice_status` | Cora answers stage / waiting-on from the case record, inventing nothing |
+| 5 | Month-end close sweep | `daily_close_sweep` | Ivy fans across the backlog via `instances` — each copy claims a **disjoint** invoice atomically |
 
 ## Why these scenarios
 
-Every AP team sees these five shapes in real life. They cover:
+1. **The routine case** — most invoices extract cleanly and route by amount.
+2. **The trust mechanism** — a confirmed duplicate is forced to a controller
+   review *in code*, not left to a model's judgement.
+3. **The bidirectional case** — a real mismatch back-edges to re-extraction
+   (bounded) rather than auto-paying or force-balancing.
+4. **The coordinator** — status is answered from the record, never invented.
+5. **The fan-out** — the close sweep drains a backlog with no double-work.
 
-1. **The 80% case** — most invoices are sub-ceiling, PO-matched, no
-   anomalies. Scenario 1 confirms the routine path runs straight through.
-2. **The trust mechanism** — when fraud signals fire, the routing must
-   bypass the AP clerk and land on Controller. Scenario 2 verifies the
-   override fires correctly.
-3. **The bidirectional case** — a real AP team spends most of its
-   judgement time on PO mismatches. Scenario 3 verifies the
-   vendor-comms side-arm activates (exception_query mode) and we draft
-   a clean vendor query rather than auto-paying or auto-rejecting.
-4. **The default-deny ceiling** — for high-value items, the approval
-   matrix forces CFO involvement regardless of vendor history. Scenario 4
-   verifies the threshold conditions on `gl_coding_agent`'s wires actually
-   route to CFO + that dual-sign logic engages above the high-value
-   floor.
-5. **The reverse direction** — vendors ask AP for status all day long.
-   Scenario 5 verifies the `vendor_inquiry` entry point (vendor_comms,
-   inquiry_response mode) produces a drafted response (it does NOT
-   auto-send — every reply still has a Controller in the loop on the
-   audit trail).
+## Note
 
-## What's NOT in the scaffold examples (yet)
-
-A real shop runs many more shapes — accruals, credit memos, intercompany
-transfers, 1099 prep, currency conversion, expense-report ingest. These
-are tracked in the parent README's roadmap section and added as the
-suite expands. If a scenario you need is missing today, write it as a
-new `06_*.json` and the runner picks it up automatically.
+These run the full LLM chain (Tier 1: license + API keys + Redis). The finisher
+and floor guarantees are also covered without any LLM/Redis in
+`tests/test_floors.py`. Add a `06_*.json` and the runner picks it up
+automatically.

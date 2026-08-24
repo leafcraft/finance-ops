@@ -1,0 +1,8 @@
+{
+  "_entry_point": "portal_invoice",
+  "_description": "Globex freight ($12K) billed against PO-55500, but the goods receipt is short 8 units. Mat's 3-way match floor finds the quantity variance, cross-check fails, and it back-edges to Ivy (bounded, one round) before terminating to the Finance-Ops Lead.",
+  "data": {
+    "source_ref": "evt-globex-9001",
+    "message": "Freight invoice uploaded via the supplier portal."
+  }
+}

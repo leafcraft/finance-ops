@@ -1,11 +1,17 @@
-# finance-ops — runtime dependencies
+# finance-ops — Finance-Operations Pod
 #
-# leafmesh: SDK floor 2.4 — the human-gate routing (human_message
-# meta fields) and the audit sink registration (mesh.intelligence)
-# in this template require SDK 2.4+.
-leafmesh>=2.4.0
+# Core LeafMesh installs everywhere (all LLM providers included) and runs the
+# pod DAY-0 against the seed source store — no connector needed.
+leafmesh>=2.4.131
+python-dotenv>=1.0
+apscheduler>=3.10        # required for the daily_close_sweep wake_up cron to fire
+PyYAML>=6.0              # used by validate_config.py
 
-# Scheduler (enables wake_up cron in YAML)
-apscheduler>=3.10.0
-python-dotenv>=1.0.0
-PyYAML>=6.0
+# ── Optional, per what you wire ──────────────────────────────────────────────
+# To connect a real ERP / mailbox (Tier 2 — the mcp block in configs/config.yaml):
+#     pip install 'leafmesh[mcp]>=2.4.131'
+#
+# For every channel/listener/knowledge/storage backend at once:
+#     pip install 'leafmesh[all]>=2.4.131'
+#   ⚠️ leafmesh[all] does NOT install on Python 3.12+ (it pulls `cchardet`,
+#      which has no wheel). On 3.12+ add only the specific extras you need.

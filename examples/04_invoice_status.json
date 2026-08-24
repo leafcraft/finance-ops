@@ -1,0 +1,8 @@
+{
+  "_entry_point": "invoice_status",
+  "_description": "Someone asks 'where is this invoice?' — Cora answers current stage / waiting-on / next gate from the case record, inventing nothing.",
+  "data": {
+    "invoice_id": "inv-globex-9001",
+    "message": "Where is the Globex freight invoice in the approval flow?"
+  }
+}

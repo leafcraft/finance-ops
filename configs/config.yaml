@@ -1,1711 +1,583 @@
-# finance-ops — Finance Operations
+# finance-ops — Finance-Operations Pod (AP / AR / month-end close)
 #
-# AP / AR / close-cycle automation. A TEAM of agents that talk peer-to-peer:
-# invoice-intake calls matching, matching calls intake back for
-# re-extraction, intake can call payment-risk, payment-risk can call the
-# Controller. Conditions
-# on every wire decide whether the call actually fires. The Manager
-# watches and intervenes only on exceptions, narration hints, contract
-# violations, escalations.
+# A pod of five digital employees + four human roles that runs a payable
+# end to end: invoice arrives -> extracted (confidence-scored, AP/AR/close
+# classified) -> duplicate + fraud screen -> matched + GL-coded (form built,
+# cross-checked) -> approval tier (clerk / controller / CFO) -> posted to the
+# ERP -> live status. The month-end close sweep fans the same intake across the
+# aging backlog.
 #
-# ═══════════════════════════════════════════════════════════════════
-# WHY LEAFMESH (the value the ROI calculator promises is the value here)
-# ═══════════════════════════════════════════════════════════════════
-# Finance / back-office is the {{routine}}% routine-share function the
-# ROI doc flags as ~5-6% of revenue and high-visibility (regulator),
-# top-of-stack for governed agents. The control-plane primitives this
-# template uses — all of which are first-class YAML, not Python glue:
+# The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off
+# is a finished contract; every human gate default-denies on silence; the
+# finisher posts the real entry and fails closed; the WORM sink is the terminus.
+# Systems (email / vendor portal / ERP) are TOOLS inside agents, never members.
 #
-#   1. PEER-TO-PEER mesh — invoice_intake → matching → gl_coding are
-#      direct `can_call` edges with `condition:` on each. The Manager
-#      is NOT in the loop on the happy path.
-#   2. Multi-entry — invoices arrive via email, vendor portal, ERP
-#      webhook, mobile-photo capture, manual entry, OR a scheduled
-#      month-end close orchestrator wakes itself. Six `entry_points:`.
-#   3. Self-correcting LLM output — `enforce_yields: true` +
-#      `enforce_yields_retry: 3` on intake-extraction / fraud / GL-coding.
-#      The Manager triggers Summarizer-driven correction on contract
-#      violations.
-#   4. Knowledge-grounded policy — `knowledge:` blocks point each LLM
-#      agent at the customer's AP policy / vendor-master / fraud
-#      playbook. Updates to the doc propagate immediately — no model
-#      retraining.
-#   5. Channel-native HITL — AP clerk, Controller, CFO all run on
-#      `human_interface: default` (Hosted Studio inbox) by default;
-#      channel adapters (Slack, Teams) trivially swap in.
-#   6. Manager-level knowledge + adaptive routing — the
-#      Summarizer/Manager reads `groupName: "ap_runbook"` on every
-#      analysis turn; learning routing on for non-regulated paths,
-#      static for regulated.
-#   7. Native event-bus subscribers — every state transition emits a
-#      typed event the audit sink + SIEM consume out-of-band.
-#   8. Self-healing — graduated recovery on agent fault.
+# Design doctrine: .claude/skills/leafmesh/building-agents-thoroughly.md
+# Field reference:  .claude/skills/leafmesh/agent-config-fields.md
+# SDK gotchas:      .claude/skills/leafmesh/nuances-and-gotchas.md
 
 name: "finance-ops"
-version: "1.0.0"
-architecture: "managed_mesh"
-environment: "development"
+version: 1.0.0
+architecture: managed_mesh
+environment: development
 debug: true
-log_level: "INFO"
+log_level: INFO
 
-# ═══════════════════════════════════════════════════════════════════
-# REDIS — session state, dedup window, vendor cache
-# ═══════════════════════════════════════════════════════════════════
-redis:
-  host: "${REDIS_HOST:localhost}"
-  port: ${REDIS_PORT:6379}
-  db: 0
-  password: "${REDIS_PASSWORD:}"
-  auto_storage: true
-  decode_responses: true
-  default_ttl: 86400              # invoices outlive sessions; keep state a day
-  session_ttl: 86400
+persistence:
+  backend: redis
+  redis:
+    host: "${REDIS_HOST:localhost}"
+    port: ${REDIS_PORT:6379}
+    password: "${REDIS_PASSWORD:}"
 
-# ═══════════════════════════════════════════════════════════════════
-# AUTO-DISCOVER — match agency/*_agent.py function names to YAML
-# ═══════════════════════════════════════════════════════════════════
 auto_discover:
-  directory: "./agency"
-  pattern: "*_agent.py"
-  recursive: false
+  directory: ./agency
+  pattern: '*_agent.py'
 
-# ═══════════════════════════════════════════════════════════════════
-# MANAGER — supervisor, NOT router
-# Watches via Summarizer; intervenes on narration, escalation,
-# contract violations. Routing mode is "learning" for non-regulated
-# decisions; the approval-amount thresholds are deterministic
-# (explicit conditions on the wires into the HITL gates).
-# ═══════════════════════════════════════════════════════════════════
+# The Manager is the SUPERVISOR — it watches every hand-off and escalates
+# stalls / contract violations / repeated errors to the Finance-Ops Lead. It is
+# not a router in the middle of the team.
 manager:
-  enabled: true
-  model: "gpt-4o-mini"
-  domain: "generic"
-  can_intervene: true
-
+  model: gpt-4o-mini
+  domain: generic
   prompt: |
-    This mesh handles accounts payable, accounts receivable, and the
-    monthly close cycle. A successful invoice lifecycle:
-      - intake normalises any source into a canonical InvoiceEvent AND
-        extracts structured fields + routing flags (yields-driven,
-        retry on bad shape)
-      - matching (PO match, then 3-way when required) and payment-risk
-        (duplicate + fraud verdict) run in parallel
-        when their conditions are met; otherwise they skip
-      - the dollar-threshold approval matrix lives directly on
-        gl_coding's outbound wires (explicit YAML conditions)
-      - the right HITL tier signs off (AP clerk / Controller / CFO)
-      - the ERP poster lands the entry; the audit logger records every
-        state transition
-
-    Escalate when:
-      - any intake extraction fails after 3 retries with corrective feedback
-      - any invoice >$50K with no PO and no auditable approval trail
-      - payment-risk duplicate detection fires on a vendor with >2 paid
-        invoices in 7 days
-      - the close-cycle orchestrator finds reconciliation gaps after
-        the soft close
-
-    Watch for:
-      - vendor patterns (same vendor, escalating amounts, round numbers)
-      - GL-coding drift (same vendor, different cost centers month-on-month)
-      - close-cycle delays (any function not posted by EOM-1)
-
+    This mesh runs accounts payable, accounts receivable, and the month-end
+    close. A successful invoice flows arrival -> Ivy (extract, confidence-scored,
+    AP/AR/close classified) -> Ray (duplicate + fraud screen) -> Mat (PO/3-way
+    match + GL coding, cross-checked) -> the right approval tier (AP clerk /
+    Controller / CFO) -> Poe (post to the ERP), and Cora keeps live status.
+    Escalate to the Finance-Ops Lead when: an invoice loops on re-matching more
+    than its bound, a policy flag or possible duplicate is raised, an approval
+    round times out, or any agent hands off a malformed artifact. Silence never
+    advances an invoice.
   routing:
-    mode: "learning"
-    memory_size: 200
-    confidence_threshold: 0.7
-    fallback: "all"
-    decay_days: 30
-
-  # ── Manager-level knowledge (BRD-019) ──
-  # Summarizer reads the AP runbook + approval matrix on every turn.
-  # Updates to the doc propagate to manager decisions, no retraining.
-  knowledge:
-    serviceName: "mongo_main"
-    enabled: true
-    groupName: "ap_runbook"
-
+    mode: static
   escalation:
-    # Three target types so notification is resilient to single-channel outage
     targets:
-      - type: "human_agent"
-        agent: "controller_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{invoice_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_FIN_OPS_CHANNEL:}"
-        message_template: "[finance-ops] {{message}} — invoice {{invoice_id}} (session {{session_id}})"
-
+      - type: human_agent
+        agent: finance_ops_lead_human
     auto_escalate:
-      max_retries: 2
-      max_errors_per_session: 3
+      max_retries: 3
+      max_errors_per_session: 5
       timeout_threshold: 2
 
-  health_check_interval: 60
-  agent_timeout_threshold: 300
-  chain_completion_timeout: 600
-
-# ═══════════════════════════════════════════════════════════════════
-# MESH
-# ═══════════════════════════════════════════════════════════════════
 mesh:
-  call_timeout: 120
+  call_timeout: 150
 
-# ═══════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════
-data_structures:
-  InvoiceEvent:
-    type: "object"
-    properties:
-      invoice_id: { type: "string" }
-      source: { type: "string" }                    # email | portal | erp_webhook | mobile | manual
-      source_event_id: { type: "string" }           # idempotency key
-      received_at_utc: { type: "string" }
-      vendor_id: { type: "string" }
-      vendor_name: { type: "string" }
-      amount_cents: { type: "number" }
-      currency: { type: "string" }
-      po_number: { type: "string" }
-      line_items: { type: "list" }
-      due_date: { type: "string" }
-      raw_payload: { type: "object" }
-    required: ["source", "vendor_id", "amount_cents", "currency"]
+# 2.4.131 runtime block — the ONE non-default this pod genuinely needs:
+# extracting a dense multi-line invoice (and a fanned close sweep) can run long.
+# Everything else stays default (omission is meaningful; we do not pre-fill
+# defaults). NOTE: `timeouts` is rejected by <=2.4.130 — it must land WITH the
+# 2.4.131 floor, never before.
+timeouts:
+  llm_hard_timeout_s: 300
 
-# ═══════════════════════════════════════════════════════════════════
-# ENTRY POINTS — Rule 1: workflow starts from many places
-# ═══════════════════════════════════════════════════════════════════
+# ── Entry points — one per real-world trigger ────────────────────────────────
 entry_points:
-  - name: "email_invoice"
-    target: "invoice_intake_agent"
-    description: "Vendor emails invoice to AP@company.com"
-
-  - name: "portal_invoice"
-    target: "invoice_intake_agent"
-    description: "Vendor uploads via supplier portal"
-
-  - name: "erp_webhook"
-    target: "invoice_intake_agent"
-    description: "ERP raises 'invoice received' webhook"
-
-  - name: "mobile_capture"
-    target: "invoice_intake_agent"
-    description: "Finance captures invoice via mobile photo"
-
-  - name: "manual_entry"
-    target: "invoice_intake_agent"
-    description: "Direct human entry into the inbox (no source system)"
-
-  - name: "monthly_close"
-    target: "close_cycle_orchestrator_agent"
-    description: "Scheduled month-end close — reconciliation sweep + reporting"
-
-  - name: "vendor_inquiry"
-    target: "vendor_comms_agent"
-    description: "Vendor asking about payment status / dispute / receipt (inquiry_response mode)"
-
-  - name: "payment_status_query"
-    target: "vendor_comms_agent"
-    description: "Targeted vendor query: where is my payment? (lookup + status; inquiry_response mode)"
-
-  - name: "dispute_resolution"
-    target: "vendor_comms_agent"
-    description: "Vendor disputes an invoice or payment — escalates to controller (inquiry_response mode)"
-
-  - name: "tax_form_request"
-    target: "vendor_comms_agent"
-    description: "Vendor requests W9 / 1099 / tax certificate (inquiry_response mode)"
-
-  - name: "new_vendor_first_invoice"
-    target: "vendor_compliance_agent"
-    description: "First invoice from an unknown vendor — KYC screen + onboarding gate before any payment path"
-
-  - name: "duplicate_check"
-    target: "payment_risk_agent"
-    description: "Standalone duplicate-detection sweep (pass detection_mode=strict|loose) — flags re-submitted invoices before they re-enter the chain"
-
-  - name: "payment_run_kickoff"
-    target: "payment_scheduler_agent"
-    description: "Treasurer initiates a payment run — picks pay dates + flags early-payment discount captures"
-
-# ═══════════════════════════════════════════════════════════════════
-# AGENTS — The team
-#
-# Mesh shape (peer-to-peer, NOT a pipeline):
-#
-#   any entry_point → invoice_intake_agent (LLM — normalize + extract,
-#                       yields-driven enforcement)
-#                       │
-#         ┌─────────────┴──────────────────┐
-#         │                                │
-#         ▼ (if PO or 3-way match req)     ▼ (if anomaly risk)
-#    matching_agent                   payment_risk_agent
-#    (PO match → 3-way when req'd)    (dup ledger pre-flight + fraud)
-#         │                                │
-#         └──── all reach ────► gl_coding_agent (LLM)
-#                       │
-#                       │  approval matrix = explicit conditions on
-#                       │  gl_coding's outbound wires (no router agent;
-#                       │  a controller reads the thresholds in YAML)
-#         ┌─────────────┼─────────────────┐
-#         ▼             ▼                 ▼
-#    ap_clerk_human  controller_human  cfo_human    (HITL — channel-native)
-#         │             │                 │
-#         └──── posted ───► erp_poster_agent → audit_logger_agent
-#
-#   Peer collaboration:
-#     matching ↔ invoice_intake (re-extract on PO miss)
-#     payment_risk ↔ controller_human (high-risk override)
-#
-#   vendor_comms is a side-arm callable from matching or payment_risk
-#   when either of them needs to ask the vendor a question
-#   (exception_query mode); it also ANSWERS vendor inquiries arriving
-#   via its own entry points (inquiry_response mode).
-#
-#   close_cycle_orchestrator runs on cron; it does NOT participate in
-#   the per-invoice flow above — it sweeps once per cycle.
-# ═══════════════════════════════════════════════════════════════════
-
-# ── Direct-call entry points (every non-human, non-terminal
-#    agent is API-addressable; bypasses the upstream chain).
-#    Use for ad-hoc invocation, debugging, programmatic ingest.
-  - name: "direct_call_invoice_intake"
-    target: "invoice_intake_agent"
-    description: "On-demand direct call to invoice_intake (llm, normalize + extract) — bypasses upstream chain"
-
-  - name: "direct_call_matching"
-    target: "matching_agent"
-    description: "On-demand direct call to matching (programmatic, PO + 3-way) — bypasses upstream chain"
-
-  - name: "direct_call_payment_risk"
-    target: "payment_risk_agent"
-    description: "On-demand direct call to payment_risk (llm, duplicate pre-flight + fraud verdict) — bypasses upstream chain"
-
-  - name: "direct_call_gl_coding"
-    target: "gl_coding_agent"
-    description: "On-demand direct call to gl_coding (llm) — bypasses upstream chain"
-
-  - name: "direct_call_vendor_comms"
-    target: "vendor_comms_agent"
-    description: "On-demand direct call to vendor_comms (llm, mode-dispatched) — bypasses upstream chain"
-
-  - name: "direct_call_erp_poster"
-    target: "erp_poster_agent"
-    description: "On-demand direct call to erp_poster (programmatic) — bypasses upstream chain"
-
-  # ── Lyzr-inspired agents (added in 2.3.x; enables banking sub-variant) ──
-  - name: "kyc_verify"
-    target: "vendor_compliance_agent"
-    description: "KYC verification for a new counterparty (customer / vendor / loan applicant; kyc_only mode)"
-
-  - name: "loan_application"
-    target: "loan_origination_agent"
-    description: "Process a loan application — credit check + policy + decision"
-
-  - name: "loan_payment_posting"
-    target: "loan_servicing_agent"
-    description: "Post a loan payment (mode=post_payment)"
-
-  - name: "loan_payoff_quote"
-    target: "loan_servicing_agent"
-    description: "Generate a payoff quote for a loan (mode=payoff_quote)"
-
-  - name: "loan_delinquency_sweep"
-    target: "loan_servicing_agent"
-    description: "Daily sweep — move loans into delinquency buckets"
-
-  - name: "regulatory_daily_scan"
-    target: "regulatory_monitor_agent"
-    description: "Daily 07:00 — pull SEC/FinCEN/IRS/EU feeds; flag relevant to finance processes"
-
+  - name: email_invoice
+    target: invoice_intake_agent
+    description: "A vendor emails an invoice to AP@ — Ivy opens the case and extracts."
+    condition: always
+  - name: portal_invoice
+    target: invoice_intake_agent
+    description: "A vendor uploads via the supplier portal — Ivy extracts."
+    condition: always
+  - name: erp_webhook
+    target: invoice_intake_agent
+    description: "The ERP raises an 'invoice received' webhook — Ivy extracts."
+    condition: always
+  - name: new_invoice
+    target: fin_coordinator_agent
+    description: "AP keys an invoice in manually — Cora opens the case and orchestrates."
+    condition: always
+  - name: invoice_status
+    target: fin_coordinator_agent
+    description: "Anyone asks 'where is this invoice / payment?' — Cora answers from the case record."
+    condition: always
+  - name: daily_close_sweep
+    target: invoice_intake_agent
+    description: "Scheduled month-end sweep — Ivy fans across the aging / unposted backlog."
+    condition: always
+  - name: approver_reply
+    target: ap_clerk_human
+    description: "HITL resume — an AP clerk answers Ivy's question or signs off a coding sheet."
+    condition: always
 
 agents:
 
-  # ────────────────────────────────────────────────────────────
-  # invoice_intake_agent — multi-source normalizer + extractor
-  # LLM, yields-driven; one call normalizes the invoice AND
-  # extracts the structured fields + routing flags.
-  # Micro-module (agency/invoice_intake_agent.py):
-  #   @pre_compose load_intake_context — pulls the vendor-master record +
-  #     the vendor's prior-invoice history from the source store (ERP in
-  #     prod) BEFORE extraction, so the LLM is grounded in what we already
-  #     know about the vendor (first-time? default terms?).
-  #   @chain enforce_intake_floor — the deterministic COMPLETENESS +
-  #     routing-flag floor: a vendorless / amountless invoice is flagged
-  #     intake_incomplete (never flows on the LLM's say); the policy
-  #     routing flags (>= $1K+PO → PO match, >= $5K → 3-way, >= $10K /
-  #     first-time / round-thousand → anomaly) are RE-ASSERTED (LLM may
-  #     raise, never lower); a hard-escalation condition routes to review.
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Cora — Finance-Ops Coordinator (AI). Owns the case end to end: opens it,
+  # orchestrates the pod, keeps live status, is the requester's one contact.
+  # Pure orchestration — never extracts, never codes, never approves. (Pure YAML.)
+  # ─────────────────────────────────────────────────────────────────────────
+  fin_coordinator_agent:
+    name: fin_coordinator_agent
+    communication_type: chain
+    agent_type: llm
+    model: gpt-4o-mini
+    temperature: 0.1
+    description: "Finance-Ops Coordinator — opens the case, orchestrates, keeps status, single point of contact."
+    prompt: |
+      You are Cora, the Finance-Ops Coordinator. You OWN each invoice from the
+      moment it arrives to the moment it is posted. You orchestrate the pod and
+      keep the requester informed — you never extract an invoice, code an entry,
+      or approve anything yourself.
+
+      On a new invoice: open a case, record the arrival time, hand it to Ivy for
+      extraction. On a status ask: answer current stage / waiting-on / next gate
+      from the case record — nothing invented. Route any specialist's exception
+      to the Finance-Ops Lead; never make the policy call yourself.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"action": ..., "invoice_id": ..., "stage": ..., "waiting_on": ..., "summary": ...}
+    yields:
+      action: "string"        # open_case | status | escalate
+      invoice_id: "string"
+      stage: "string"
+      waiting_on: "string"
+      summary: "string"
+    can_call:
+      - agent: invoice_intake_agent
+        condition: "calling_agent_response.action == 'open_case'"
+      - agent: finance_ops_lead_human
+        condition: "calling_agent_response.action == 'escalate'"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Ivy — Invoice Intake & Extraction Analyst (AI, Super-Agent). Reads every
+  # invoice with a per-field confidence score, classifies the lane (AP / AR /
+  # close item), and runs the policy pre-check. This is where "zero data-entry
+  # errors" is won: a field it cannot read with confidence becomes a QUESTION to
+  # the AP clerk, never a guess into a coding sheet. Loops its tools (read
+  # sources) until the extract is CLEAN, then hands verified line-items to Ray /
+  # Mat (contract). super_agent = autonomous plan/execute/verify across a dense
+  # invoice; @chain = the confidence floor (fail closed). instances = the close
+  # sweep fans the SAME analyst across the aging backlog, each copy claiming a
+  # disjoint invoice via the atomic claim tool.
+  # ─────────────────────────────────────────────────────────────────────────
   invoice_intake_agent:
-    name: "invoice_intake_agent"
-    agent_type: "llm"
-    description: "Normalizes invoices from any source into the canonical InvoiceEvent schema and extracts structured fields + routing flags"
-    model: "gpt-4o-mini"
+    name: invoice_intake_agent
+    communication_type: chain
+    agent_type: llm
+    model: claude-sonnet-4-6
     temperature: 0.1
-    max_tokens: 1500
-    communication_type: "dual"          # bidirectional — matching can call back for re-extraction
-
+    max_tool_calls_per_message: 15   # a dense invoice + backlog claim; default 5 truncates silently
+    description: "Invoice Intake & Extraction Analyst — reads each invoice with confidence, classifies AP/AR/close, policy pre-check."
+    # Scheduled month-end sweep — in the company's timezone (NOT UTC). Also
+    # reachable via the daily_close_sweep entry point. Set `timezone` to yours.
+    wake_up: "0 6 * * *"
+    timezone: "Asia/Kolkata"
+    wake_up_input:
+      trigger: daily_close_sweep
+    super_agent:                     # dict form = the tuning path (2.4.123+)
+      cost_ceiling: 120000
+      wall_clock: 900
+    # Backlog fan-out — one activation, N copies, each claims a DISJOINT invoice
+    # from the sweep backlog via claim_next_invoice (atomic). `each` routes every
+    # copy on its OWN yields (so each claimed invoice flows independently — a
+    # per-invoice request simply has copies 2..N claim nothing and route nothing).
+    # For a pure one-invoice-at-a-time deployment, set instances: 1.
+    instances: 3
+    instances_handoff: each
     prompt: |
+      You are Ivy, the Invoice Intake & Extraction Analyst. Your job is to turn a
+      raw invoice into confidence-scored, source-traced line-items — and to
+      REFUSE to guess. Read the invoice from email, the supplier portal, or the
+      ERP webhook payload. On a close sweep, call claim_next_invoice to pull ONE
+      unclaimed invoice from the backlog before you read anything. Read each line
+      for description, quantity, unit price, amount, tax, with a confidence score
+      on every field. Classify the lane (ap_invoice / ar_invoice / close_item)
+      and run the policy pre-check.
 
+      NEVER invent an amount, vendor, PO, or date no source shows. A field you
+      cannot read with confidence is one targeted QUESTION to the AP clerk, not a
+      coding-sheet entry. Route policy ambiguity or a possible duplicate to the
+      Finance-Ops Lead. Hand verified line-items on ONLY when the extract is
+      clean. Load the `ap_intake` / `ar_intake` / `close_sweep` playbook for the
+      exact read-before-write order for the lane you are in.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"invoice_id": "", "source": "", "source_event_id": "", "vendor_id": "", "vendor_name": "", "amount_cents": 0, "currency": "", "po_number": "", "line_items": [], "due_date": "", "raw_payload": {}, "tax": {}, "payment_terms": "", "requires_po_match": false, "requires_3way_match": false, "anomaly_risk": false, "intake_incomplete": false, "intake_blocking_reasons": [], "intake_hard_escalate": false}
-      You process accounts-payable invoices from many sources (email
-      attachments, supplier portal uploads, ERP webhooks, mobile photo
-      capture, manual entry) in two stages, in one pass.
-
-      STAGE 1 — NORMALIZE. Map the source payload into the canonical
-      InvoiceEvent schema. Extract every available field. Preserve the
-      raw payload verbatim in `raw_payload`. Identify the vendor by
-      canonical ID (look up vendor master if you have one); if you can
-      only get vendor_name, return that and leave vendor_id empty for
-      downstream resolution.
-
-      Do NOT invent line items. If the source doesn't carry line
-      detail, return an empty list — downstream agents handle missing
-      detail gracefully.
-
-      STAGE 2 — EXTRACT. From the normalized invoice, pull the deeper
-      structured fields needed downstream:
-        - line_items: list of objects (description, quantity, unit_price, total)
-        - tax: object with jurisdiction, rate, amount; empty object when none
-        - payment_terms: string like Net30 / Net45; set "Net30" when unknown
-        - currency: ISO-4217 currency string, UPPERCASE; set "USD" when
-          the document carries no currency; confirm matches header
-        - requires_po_match: boolean — true if vendor/policy demands PO match
-        - requires_3way_match: boolean — true on high-risk vendor or amount
-        - anomaly_risk: boolean — true on round-number amounts, first-time
-          vendor, or any other red flag
-
-      DETERMINISTIC RULES (apply these EXACTLY — they are policy, not
-      judgment; you may RAISE a routing flag the rules missed, you must
-      NEVER lower one the rules demand):
-        - invoice_id: use the document's invoice number; if the document
-          has none, derive a deterministic id "inv-<source_event_id>"
-          (or "inv-<vendor>-<date>" when no source_event_id exists).
-        - amount_cents: integer cents; never alter the documented amount.
-        - requires_po_match = true whenever amount_cents >= 100000 ($1K)
-          AND a po_number is present.
-        - requires_3way_match = true whenever amount_cents >= 500000 ($5K).
-        - anomaly_risk = true whenever amount_cents >= 1000000 ($10K),
-          OR vendor_id is empty / first-time-seen,
-          OR the amount is a round thousand (amount_cents divisible by
-          100000 — e.g. 500000, 1200000).
-
-      If matching later asks you to re-extract with PO context, you
-      receive a rerun context — re-extract more carefully focused on
-      matching the PO's line items.
-
-      MODULE-SET FIELDS (do NOT set these yourself — the intake
-      completeness floor in agency/invoice_intake_agent.py fills them
-      from your extraction; leave them out and the module sets them):
-        - intake_incomplete: true when the invoice is structurally
-          broken (no vendor at all, or amount <= 0).
-        - intake_blocking_reasons: the specific blocking reasons.
-        - intake_hard_escalate: true when the invoice is incomplete OR a
-          first-time vendor bills over the $10K anomaly line — the wire
-          then routes it to review rather than down the normal chain.
-
-      OUTPUT FORMAT — Return JSON with these keys (all required; do
-      not omit any):
-        - invoice_id: string
-        - source: string
-        - source_event_id: string
-        - vendor_id: string
-        - vendor_name: string
-        - amount_cents: number
-        - currency: string
-        - po_number: string
-        - line_items: list
-        - due_date: string
-        - raw_payload: object
-        - tax: object
-        - payment_terms: string
-        - requires_po_match: boolean
-        - requires_3way_match: boolean
-        - anomaly_risk: boolean
-        - intake_incomplete: boolean (module-set)
-        - intake_blocking_reasons: list (module-set)
-        - intake_hard_escalate: boolean (module-set)
-
-    enforce_yields: true
-    enforce_yields_retry: 3
-
-    # Vendor-specific extraction hints + AP policy flags.
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "vendor_master"
-
+      {"extract_clean": ..., "doc_class": ..., "low_confidence_fields": ...,
+       "policy_flags": ..., "line_items": ..., "invoice_id": ..., "vendor_id": ...,
+       "amount_cents": ..., "po_number": ..., "due_date": ..., "anomaly_risk": ...,
+       "question_for_reviewer": ...}
     yields:
+      extract_clean: "boolean"
+      doc_class: "string"            # ap_invoice | ar_invoice | close_item
+      low_confidence_fields: "array"
+      policy_flags: "array"
+      line_items: "array"
       invoice_id: "string"
-      source: "string"
-      source_event_id: "string"
       vendor_id: "string"
-      vendor_name: "string"
       amount_cents: "number"
-      currency: "string"
       po_number: "string"
-      line_items: "list"
       due_date: "string"
-      raw_payload: "object"
-      tax: "object"
-      payment_terms: "string"
-      requires_po_match: "boolean"      # vendor-specific: does this vendor require PO?
-      requires_3way_match: "boolean"    # high-risk vendor / amount triggers 3-way
-      anomaly_risk: "boolean"           # round-number, first-time vendor, etc.
-      # Completeness floor (deterministic, agency/invoice_intake_agent.py)
-      intake_incomplete: "boolean"      # no vendor / amount <= 0 → don't trust the LLM
-      intake_blocking_reasons: "list"   # which floor checks failed
-      intake_hard_escalate: "boolean"   # incomplete OR first-time vendor >= $10K → review
-
-    inputs:
-      payload: "object"               # raw source payload — variable per source
-
-    context_parts:
-      guardrails: |
-        Never alter the amount or currency. If the document is
-        ambiguous, leave the field empty and surface it in raw_payload.
-        Never resolve vendor_id by guessing — only set it if you have
-        a vendor-master match.
-        Tax fields must come from the document — never compute or
-        infer tax. Amount currency must match the header currency
-        verbatim. requires_po_match / requires_3way_match are policy
-        flags based on the customer's AP rules in your knowledge base.
-      flows: |
-        Source = email — parse the attached invoice (PDF/image OCR
-        upstream); use the vendor email domain as a vendor_id hint.
-        Source = portal — fields are usually structured; map directly.
-        Source = erp_webhook — already canonical; pass-through.
-        Source = mobile — photo OCR upstream; amounts may be noisy,
-        flag low-confidence reads in raw_payload.
-        Source = manual — trust the operator's entry verbatim.
-
-    # PEER-TO-PEER — intake fans out to specialists conditionally.
-    # Each `condition:` is evaluated AT intake's site, not by the
-    # Manager. The Manager hovers above watching for narration cues.
-    # The deterministic POLICY FLOOR rides on the wire itself (visible
-    # here, not buried in Python): even if the model under-flags, an
-    # invoice >= $1K with a PO always PO-matches, >= $5K always 3-way
-    # matches, >= $10K or a first-time vendor always gets risk-checked.
+      anomaly_risk: "boolean"        # round-number / first-time vendor / >=$10K — re-asserted by the floor
+      question_for_reviewer: "string"
+    # Playbook — the CRAFT, fetched on demand. Only `description` rides in the
+    # prompt; `responsibility` is loaded when the model recognises the lane.
+    playbook:
+      - intent: ap_intake
+        description: "How to read a vendor bill (accounts payable) correctly and score every field."
+        responsibility: |
+          1. Pull the source FIRST (read_invoice_sources for the event, then
+             read_po_context if a PO is cited) before scoring anything — you
+             cannot classify a bill you have not fully read.
+          2. Read each line for description, quantity, unit price, amount, tax.
+             Score EVERY field 0-1. Keep amounts in integer cents; never alter a
+             documented amount.
+          3. Resolve vendor_id ONLY from a vendor-master match — never guess it.
+          4. Any field below 0.85 confidence becomes ONE targeted question to the
+             AP clerk — never a silent guess.
+        variables: [invoice_id]
+      - intent: ar_intake
+        description: "How to read a customer invoice (accounts receivable) we are issuing/collecting."
+        responsibility: |
+          1. Read customer, amount, terms, and the revenue lines; score each.
+          2. Flag revenue-recognition items (multi-period, milestone) into
+             policy_flags for the Finance-Ops Lead — do not net or defer yourself.
+          3. Set doc_class = ar_invoice so downstream coding uses AR accounts.
+        variables: [invoice_id]
+      - intent: close_sweep
+        description: "How to sweep the aging / unposted backlog at month-end close."
+        responsibility: |
+          1. Call claim_next_invoice FIRST to pull one unclaimed backlog item;
+             if it returns available:false, there is nothing left — stop.
+          2. Extract exactly as ap_intake / ar_intake for that one item.
+          3. Flag anything that would miss the close cut-off into policy_flags.
+        variables: [invoice_id]
+      - intent: policy_precheck
+        description: "How to check an invoice against AP policy before it is coded."
+        responsibility: |
+          1. Re-assert the routing flags policy demands (you may RAISE, never
+             lower): >=$10K, a first-time / unresolved vendor, or a round-thousand
+             amount all set anomaly_risk = true.
+          2. Flag anything out of policy — do NOT waive it; route it to the
+             Finance-Ops Lead via policy_flags.
+        variables: [invoice_id, doc_class]
+    # Day-0 tool surface — reads the seed source store so the pod runs with NO
+    # connector wired. Each tool has a dev-store fallback and announces itself
+    # (available:false) when it has no real source. See agency/tools.py.
+    tools: [read_invoice_sources, read_po_context, list_prior_invoices, claim_next_invoice]
+    tool_categories: [intake]
+    # ── To wire real email / ERP, uncomment and set the URLs (each named action
+    #    under `use:` becomes its own tool, e.g. erp_read_invoice). NOTE: the SDK
+    #    rejects an http mcp block with an EMPTY url at load, so this ships
+    #    commented — fill the URL, then uncomment. ──
+    # mcp:
+    #   - transport: http
+    #     url: "${ERP_MCP_URL}"
+    #     token: "${ERP_MCP_TOKEN:}"
+    #     use: [read_invoice, read_po, read_goods_receipt]
+    #     name: erp
+    #     timeout: 30
+    #   - transport: http
+    #     url: "${MAIL_MCP_URL}"
+    #     token: "${MAIL_MCP_TOKEN:}"
+    #     use: [read_messages, read_attachments]
+    #     name: mail
+    #     timeout: 30
     can_call:
-      # COMPLETENESS floor — a structurally broken invoice (no vendor /
-      # no amount) is hard-escalated to the Controller and does NOT flow
-      # into the normal chain. enforce_intake_floor sets the flag; the LLM
-      # cannot waive it.
-      - agent: "controller_human"
-        condition: "calling_agent_response.intake_hard_escalate == true"
+      - agent: ap_clerk_human
+        condition: "calling_agent_response.extract_clean == false and calling_agent_response.question_for_reviewer != ''"
+      - agent: finance_ops_lead_human
+        condition: "calling_agent_response.policy_flags != []"
+      - agent: payment_risk_agent
+        condition: "calling_agent_response.extract_clean == true and calling_agent_response.anomaly_risk == true"
+      - agent: matching_gl_agent
+        condition: "calling_agent_response.extract_clean == true and calling_agent_response.anomaly_risk == false"
 
-      - agent: "matching_agent"
-        # floor: >= $1K with a PO → PO match; >= $5K → 3-way match
-        # (skip when the completeness floor flagged the invoice)
-        condition: "calling_agent_response.intake_incomplete == false and (calling_agent_response.requires_po_match == true or calling_agent_response.requires_3way_match == true or (calling_agent_response.amount_cents >= 100000 and calling_agent_response.po_number != '') or calling_agent_response.amount_cents >= 500000)"
-
-      - agent: "payment_risk_agent"
-        # floor: >= $10K or first-time vendor (empty vendor_id) is always
-        # risk-checked; round-number detection lives in the prompt rules
-        condition: "calling_agent_response.intake_incomplete == false and (calling_agent_response.anomaly_risk == true or calling_agent_response.amount_cents >= 1000000 or calling_agent_response.vendor_id == '')"
-
-      - agent: "gl_coding_agent"
-        # GL-coding runs on every COMPLETE invoice — its result is needed
-        # regardless of matching / fraud outcomes.
-        condition: "calling_agent_response.intake_incomplete == false"
-
-    narration: |
-      If you detect a vendor whose name appears in the AP runbook's
-      "watchlist" group, suggest that payment_risk_agent be invoked
-      regardless of anomaly_risk.
-      If line items reference services >$25K, suggest controller
-      override even if the approval matrix doesn't demand it.
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # matching_agent — programmatic PO lookup + line-item match,
-  # then 3-way match (invoice ↔ PO ↔ goods-receipt) when required.
-  # agency/matching_agent.py:
-  #   @pre_compose load_po_context — pulls the PO (+ goods receipt) and
-  #     vendor record from the source store (the ERP in prod); matching
-  #     fetches its own authority, not the upstream LLM's echo.
-  #   @chain enforce_match_floor — the deterministic 3-way TOLERANCE
-  #     arithmetic (qty/price variance vs fixed tolerances in
-  #     agency/_shared/matching_math); any line outside tolerance fails
-  #     the match — the LLM/body can't present a mismatch as clean.
-  # ────────────────────────────────────────────────────────────
-  matching_agent:
-    name: "matching_agent"
-    agent_type: "programmatic"
-    description: "Looks up the PO in ERP, matches line items, then runs the 3-way match (invoice ↔ PO ↔ goods-receipt) when required"
-    communication_type: "dual"          # can call intake back on PO miss for re-extraction
-
-    yields:
-      # PO-match phase
-      po_found: "boolean"
-      po_retry_exhausted: "boolean"    # loop guard — true after the one allowed re-extraction
-      po_id: "string"
-      lines_matched: "number"
-      lines_total: "number"
-      match_percentage: "number"        # 0..1
-      discrepancies: "list"             # short descriptions of mismatches
-      # 3-way phase (vacuous defaults when 3-way not required)
-      three_way_matched: "boolean"
-      receipt_found: "boolean"
-      quantity_variance: "number"
-      price_variance_pct: "number"
-      gaps: "list"
-
-    inputs:
-      po_number: "string"
-      line_items: "list"
-      vendor_id: "string"
-      invoice_id: "string"
-      po_id: "string"
-
-    can_call:
-      # On PO miss — ask intake for ONE more extraction pass with PO
-      # context. Bounded by po_retry_exhausted (session stash counter) —
-      # unbounded, this cycle ping-pongs until the SDK chain cap kills
-      # the session.
-      - agent: "invoice_intake_agent"
-        condition: "calling_agent_response.po_found == false and calling_agent_response.po_retry_exhausted == false"
-
-      # On PO match OR clean 3-way → gl_coding (it may already be in-flight; fan-in handled there)
-      - agent: "gl_coding_agent"
-        condition: "(calling_agent_response.po_found == true and calling_agent_response.match_percentage >= 0.9) or calling_agent_response.three_way_matched == true"
-
-      # On partial PO match OR failed 3-way (with receipt) — draft a vendor query
-      - agent: "vendor_comms_agent"
-        condition: "(calling_agent_response.po_found == true and calling_agent_response.match_percentage < 0.9) or (calling_agent_response.receipt_found == true and calling_agent_response.three_way_matched == false) or (calling_agent_response.po_found == false and calling_agent_response.po_retry_exhausted == true)"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # payment_risk_agent — ONE payment-risk officer (Rule-2 merge of
-  # the duplicate detector + the fraud checker). LLM writes the fraud
-  # narrative; agency/payment_risk_agent.py owns the deterministic
-  # floors the LLM must not waive:
-  #   @pre_compose load_dup_candidates — pulls the vendor's PRIOR POSTED
-  #     invoices from the source store (the AP ledger in prod) so the
-  #     duplicate check has real evidence.
-  #   @chain enforce_dup_floor — SHA-256 dedupe hashing (strict =
-  #     vendor+invoice_id; loose = vendor+amount+due_date). A hit FORCES
-  #     is_duplicate + fraud_score >= 0.85 + controller_review; the LLM
-  #     cannot pass a confirmed duplicate. Also clamps the cardinal
-  #     "no >= 0.7 on a single signal" rule.
-  #
-  # PRODUCTION NOTE — the authoritative posted-invoice dedup check
-  # belongs against YOUR ERP's AP ledger (NetSuite / SAP / QuickBooks).
-  # Swap store.posted_for_vendor() for that query; the dedupe hashing +
-  # floor are unchanged.
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Ray — Payment-Risk Officer (AI). ONE risk desk: the duplicate ledger
+  # pre-flight AND the fraud/anomaly verdict. The LLM writes the narrative;
+  # agency/payment_risk_agent.py owns the deterministic floor the model cannot
+  # waive — SHA-256 dedupe (strict = vendor+invoice_id; loose =
+  # vendor+amount+due_date) against the posted ledger. A hit FORCES is_duplicate
+  # + fraud_score >= 0.85 + controller_review; a duplicate is never silent-dropped.
+  # ─────────────────────────────────────────────────────────────────────────
   payment_risk_agent:
-    name: "payment_risk_agent"
-    agent_type: "llm"
-    description: "Payment-risk officer — duplicate ledger pre-flight + fraud/anomaly verdict using vendor history + fraud playbook"
-    model: "gpt-4o-mini"
+    name: payment_risk_agent
+    communication_type: chain
+    agent_type: llm
+    model: gpt-4o-mini
     temperature: 0.1
-    max_tokens: 800
-    communication_type: "dual"
-
+    description: "Payment-Risk Officer — duplicate ledger pre-flight + fraud/anomaly verdict using vendor history."
     prompt: |
+      You are Ray, the Payment-Risk Officer. Every invoice that smells wrong
+      lands on your desk. Two jobs, one pass:
 
+      1. DUPLICATE CHECK — compare this invoice against the vendor's posted
+         history (list_prior_invoices is pulled for you into the deterministic
+         floor). If it is a re-submission, say so; never silent-drop a duplicate.
+      2. FRAUD VERDICT — score the invoice 0-1. NEVER score >= 0.7 on a single
+         signal; cite at least two flagged_signals or cap at 0.55. A confirmed
+         duplicate is the one exception and stands alone.
+
+      recommendation: fraud_score < 0.4 -> "pass"; 0.4 <= score < 0.7 -> "flag";
+      score >= 0.7 -> "controller_review". Write a 3-5 sentence briefing whenever
+      you recommend controller_review — a Controller reads it to defend the call
+      in an audit. The dedupe floor may RAISE your score on a confirmed duplicate;
+      it never lowers it.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"fraud_score": 0, "flagged_signals": [], "duplicate_of_invoice_id": "", "recommendation": "", "controller_briefing": "", "is_duplicate": false, "duplicate_match_kind": "", "prior_post_record_id": "", "prior_post_at_utc": "", "detection_mode": "", "duplicate_briefing": "", "risk_check_mode": ""}
-      You are the payment-risk officer for this AP team. Every invoice
-      that smells wrong lands on your desk, and so does the standalone
-      duplicate sweep. Your responsibilities:
-
-      1. DUPLICATE CHECK. Compare this invoice against the vendor's
-         payment history in your knowledge base. strict mode: a
-         duplicate is the same vendor + same invoice_id. loose mode:
-         also treat same vendor + same amount_cents + same due_date as
-         a duplicate. If you find one: set is_duplicate=true,
-         duplicate_match_kind to "strict_invoice_id_match" or
-         "loose_amount_due_date_match", populate
-         duplicate_of_invoice_id / prior_post_record_id /
-         prior_post_at_utc with whatever evidence you have (empty
-         string when unknown), and write a duplicate_briefing
-         recommending HOLD pending vendor confirmation — never
-         silent-drop a duplicate.
-
-      2. FRAUD VERDICT. Score this invoice for fraud risk. Consult the
-         fraud playbook (knowledge group) for current red flags +
-         vendor payment history.
-
-      DETERMINISTIC RULES (apply EXACTLY — these are policy):
-        - fraud_score must be a number between 0 and 1.
-        - NEVER score >= 0.7 on a single signal alone — cite at least
-          two flagged_signals, or cap the score at 0.55. The ONE
-          exception: a confirmed duplicate stands alone.
-        - A duplicate (is_duplicate=true or duplicate_of_invoice_id
-          set) forces fraud_score to at least 0.85 and
-          recommendation=controller_review.
-        - recommendation: fraud_score < 0.4 → "pass";
-          0.4 <= fraud_score < 0.7 → "flag";
-          fraud_score >= 0.7 → "controller_review".
-        - detection_mode: echo the requested mode from the input
-          ("strict" | "loose"); default "strict".
-        - risk_check_mode: "preflight" when the caller passed a
-          detection_mode input (the standalone duplicate_check entry);
-          "inline" otherwise (called off invoice_intake). This drives
-          your outbound routing — set it correctly.
-
-      Return JSON with these keys (all required; use the safe defaults
-      shown in the contract when a key does not apply):
-        - fraud_score: 0..1
-        - flagged_signals: list of specific signals (round numbers,
-          first-time vendor, escalating amounts, vendor-name similarity
-          to a known canonical vendor, unusual GL coding, amount above
-          the vendor's historical median, etc.)
-        - duplicate_of_invoice_id: populated if you detected a duplicate
-        - recommendation: pass | flag | controller_review
-        - controller_briefing: 3-5 sentence narrative for the Controller
-          reading this — lead with the recommendation, cite the two
-          strongest signals, explain WHY they matter for THIS vendor.
-          A controller approving or rejecting will read this; make it
-          easy to defend the decision in an audit. Required whenever
-          recommendation is controller_review.
-        - is_duplicate: boolean (default false)
-        - duplicate_match_kind: string (default empty)
-        - prior_post_record_id: string (default empty)
-        - prior_post_at_utc: string (default empty)
-        - detection_mode: strict | loose
-        - duplicate_briefing: string (default empty)
-        - risk_check_mode: preflight | inline
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    # Both halves of the role are playbook-grounded: load the fraud
-    # red-flag list AND the vendor payment history into this group so
-    # the duplicate judgment has real evidence to cite.
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "fraud_playbook"
-
+      {"fraud_score": ..., "flagged_signals": ..., "is_duplicate": ...,
+       "duplicate_of_invoice_id": ..., "recommendation": ..., "briefing": ...}
     yields:
-      # Fraud verdict (LLM judgment)
-      fraud_score: "number"             # 0..1
-      flagged_signals: "list"
-      duplicate_of_invoice_id: "string" # populated if duplicate
-      recommendation: "string"          # pass | flag | controller_review
-      controller_briefing: "string"     # 3-5 sentence narrative for Controller
-      # Duplicate ledger pre-flight (deterministic, module-set)
+      fraud_score: "number"          # 0..1
+      flagged_signals: "array"
       is_duplicate: "boolean"
-      duplicate_match_kind: "string"
-      prior_post_record_id: "string"
-      prior_post_at_utc: "string"
-      detection_mode: "string"          # strict | loose
-      duplicate_briefing: "string"
-      risk_check_mode: "string"         # preflight | inline — drives edges
-
+      duplicate_of_invoice_id: "string"
+      recommendation: "string"       # pass | flag | controller_review
+      briefing: "string"
     inputs:
       invoice_id: "string"
       vendor_id: "string"
       amount_cents: "number"
       due_date: "string"
-      detection_mode: "string"          # strict | loose — set by the duplicate_check entry
-
-    context_parts:
-      guardrails: |
-        Never block solely on a single signal. Always cite at least
-        two signals when scoring >= 0.7. Duplicate detection is the
-        exception — a confirmed duplicate is enough alone.
-
     can_call:
-      # High-risk — go to Controller directly, do not collect $200
-      # (a confirmed duplicate also lands here: the prompt's policy
-      # rules force fraud_score >= 0.85 on any duplicate)
-      - agent: "controller_human"
-        condition: "calling_agent_response.fraud_score >= 0.7"
-
-      # Confirmed duplicate → vendor query for AP review (never silent-drop)
-      - agent: "vendor_comms_agent"
-        condition: "calling_agent_response.is_duplicate == true"
-
-      # Medium-risk — vendor_comms formats a vendor query
-      - agent: "vendor_comms_agent"
+      - agent: controller_human
+        condition: "calling_agent_response.fraud_score >= 0.7 or calling_agent_response.is_duplicate == true"
+      - agent: finance_ops_lead_human
         condition: "calling_agent_response.fraud_score >= 0.4 and calling_agent_response.fraud_score < 0.7"
+      - agent: matching_gl_agent
+        condition: "calling_agent_response.fraud_score < 0.4 and calling_agent_response.is_duplicate == false"
 
-      # Clean inline check (called off invoice_intake) — proceed to gl_coding
-      - agent: "gl_coding_agent"
-        condition: "calling_agent_response.fraud_score < 0.4 and calling_agent_response.risk_check_mode == 'inline'"
-
-      # Clean standalone pre-flight (duplicate_check entry) — continue
-      # to invoice_intake (the normal chain)
-      - agent: "invoice_intake_agent"
-        condition: "calling_agent_response.is_duplicate == false and calling_agent_response.risk_check_mode == 'preflight'"
-
-    narration: |
-      If the vendor name is fuzzy-similar to an existing canonical
-      vendor (typosquatting), set recommendation to controller_review
-      even when individual signals are weak — typosquat is itself a
-      strong fraud signal.
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # gl_coding_agent — LLM cost center / GL / tax code
-  #
-  # Carries the APPROVAL MATRIX on its outbound wires (the old
-  # approval_router_agent is gone — the thresholds are explicit
-  # conditions below, readable by any controller):
-  #     < $5K  AND confidence >= 0.7 AND no anomaly  → ap_clerk_human
-  #     < $50K otherwise (>= $5K / low conf / anomaly) → controller_human
-  #     >= $50K                                        → cfo_human
-  #     (>= $500K: CFO dual sign-off — policy stated in cfo_human's
-  #      prompt template; the wire is the same cfo gate)
-  #
-  # Micro-module (agency/gl_coding_agent.py):
-  #   @pre_compose load_chart — pulls the active CHART OF ACCOUNTS +
-  #     the vendor's standing default GL mapping from the source store
-  #     (ERP GL master in prod) so the LLM codes against the real chart.
-  #   post-process — (1) GL-VALIDITY floor: a coded account NOT active in
-  #     the chart is rejected (confidence forced < 0.7 → Controller); the
-  #     LLM can't post to a non-existent account; (2) keyword fallback
-  #     chart when the LLM returns no coding; (3) stash the invoice+GL
-  #     context for erp_poster's post-HITL recovery.
-  # ────────────────────────────────────────────────────────────
-  gl_coding_agent:
-    name: "gl_coding_agent"
-    agent_type: "llm"
-    description: "Assigns cost center, GL account, tax code per the chart of accounts"
-    model: "gpt-4o-mini"
-    temperature: 0.0
-    max_tokens: 600
-    communication_type: "chain"
-
-    # Fan-in — gl_coding waits for whichever of {matching, payment_risk}
-    # actually fired. invoice_intake is always satisfied by the
-    # upstream chain. The `?` marks each specialist as optional so
-    # we don't deadlock when a path's condition was false.
-    wait_for: "invoice_intake_agent AND matching_agent? AND payment_risk_agent?"
-    wait_for_timeout: 60
-
+  # ─────────────────────────────────────────────────────────────────────────
+  # Mat — Matching & GL-Coding Builder (AI + finisher-lite). Turns Ivy's verified
+  # line-items into a coded entry: PO / 3-way match against the ERP, GL account +
+  # cost center per the chart, then a cross-check that totals tie out and the GL
+  # account is ACTIVE. Deliberately SEPARATE from Ivy (the reader is not the
+  # coder — a second pass catches what the first missed). Renders the draft
+  # coding sheet to ./out (@chain cross-check floor, fail closed). The APPROVAL
+  # MATRIX rides its outbound wires — explicit, auditable by reading this file.
+  # ─────────────────────────────────────────────────────────────────────────
+  matching_gl_agent:
+    name: matching_gl_agent
+    communication_type: chain
+    agent_type: llm
+    model: claude-sonnet-4-6
+    temperature: 0.1
+    description: "Matching & GL-Coding Builder — PO/3-way match + GL coding, cross-checks totals, renders the coding sheet."
     prompt: |
-
+      You are Mat, the Matching & GL-Coding Builder. Turn Ivy's verified
+      line-items into a coded entry against the company's chart of accounts —
+      same chart, no invented accounts. Match the invoice to its PO (and the
+      goods receipt when a 3-way match is required); the deterministic floor pulls
+      the PO and does the tolerance arithmetic for you. Assign gl_account and
+      cost_center; prefer the vendor's standing default. Cross-check that the
+      line-items tie out to the stated total and that the GL account is active
+      BEFORE anyone sees the sheet. If a check fails, return it to Ivy with the
+      specific discrepancy — never force the numbers to balance. Load the
+      `code_entry` playbook for the assembly + cross-check order.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"gl_account": "", "cost_center": "", "tax_code": "", "confidence": 0, "invoice_id": "", "vendor_id": "", "vendor_name": "", "amount_cents": 0, "due_date": "", "anomaly_risk": false, "gl_validity": ""}
-      Assign the GL account, cost center, and tax code for this
-      invoice. Use the chart-of-accounts knowledge group; if the
-      vendor has a default mapping in the vendor master, prefer that.
-      Otherwise infer from the line-item descriptions and the
-      department / business-unit hint.
-
-      DETERMINISTIC RULES (apply EXACTLY):
-        - confidence must be a number between 0 and 1.
-        - If you cannot confidently assign, return empty coding fields
-          with confidence < 0.7 — the approval wires then route the
-          invoice to the Controller instead of the AP clerk.
-        - gl_validity is set by the module's GL-validity floor (it checks
-          your coded account against the active chart of accounts) — do
-          NOT set it yourself; leave it out and the module fills it. A
-          code not in the active chart is rejected and confidence is
-          forced below 0.7 regardless of what you returned.
-        - Echo invoice_id, vendor_id, vendor_name, amount_cents,
-          due_date, and anomaly_risk from the upstream input UNCHANGED
-          (anomaly_risk comes from intake; default false when absent).
-          Your outbound wires route the approval tier on amount_cents,
-          confidence, and anomaly_risk — never alter them.
-        - tax_code: when the document carries no tax, use the tax
-          jurisdiction from upstream if present, else "NONE".
-
-      Return JSON with these keys (all required):
-        - gl_account: string
-        - cost_center: string
-        - tax_code: string
-        - confidence: number
-        - invoice_id, vendor_id, vendor_name, amount_cents, due_date,
-          anomaly_risk: echoed identity + routing passthrough
-
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "chart_of_accounts"
-
+      {"match_ok": ..., "cross_check_ok": ..., "discrepancy": ...,
+       "gl_account": ..., "cost_center": ..., "confidence": ...,
+       "invoice_id": ..., "vendor_id": ..., "amount_cents": ...,
+       "anomaly_risk": ..., "artifact_path": ..., "match_retry_exhausted": ...}
     yields:
+      match_ok: "boolean"
+      cross_check_ok: "boolean"
+      discrepancy: "string"
       gl_account: "string"
       cost_center: "string"
-      tax_code: "string"
-      confidence: "number"              # 0..1
-      gl_validity: "string"             # valid | invalid_account — set by the GL-validity floor
-      # Identity passthrough
+      confidence: "number"           # 0..1 — GL-coding confidence (floor forces < 0.7 on an invalid account)
       invoice_id: "string"
       vendor_id: "string"
-      vendor_name: "string"
       amount_cents: "number"
-      due_date: "string"
-      anomaly_risk: "boolean"           # passthrough from intake — drives the approval wires
-
+      anomaly_risk: "boolean"        # passthrough from intake — drives the approval matrix
+      artifact_path: "string"
+      match_retry_exhausted: "boolean"  # loop guard — true after the one allowed re-extraction
     inputs:
       upstream_yields: "object"
-
-    # ── THE APPROVAL MATRIX — explicit on the wires ──────────────
-    # Thresholds (operators tune by editing these conditions):
+    playbook:
+      - intent: code_entry
+        description: "How to match, GL-code, and cross-check an invoice before approval."
+        responsibility: |
+          1. Match every line against the PO; when a 3-way match is required,
+             reconcile invoice <-> PO <-> goods receipt. A line outside tolerance
+             is a gap — the match fails; do not wave it through.
+          2. Assign gl_account + cost_center from the vendor default or the
+             line-item descriptions. Code ONLY to an account active in the chart.
+          3. Re-check totals tie out to the source. If it does not, return to Ivy
+             with the discrepancy — do not adjust a number to make it balance.
+          4. Produce the coding sheet to ./out. Route to the approval tier the
+             amount demands (the matrix is on the outbound wires).
+        variables: [invoice_id]
+    # ── THE APPROVAL MATRIX — explicit on the wires ──────────────────────────
     #   AP clerk autonomy ceiling:  $5,000   (500000 cents)
     #   Controller ceiling:         $50,000  (5000000 cents)
     #   GL-confidence floor:        0.7
-    # Anything anomalous or low-confidence escalates at least to the
-    # Controller regardless of amount.
+    # Anything anomalous or low-confidence escalates at least to the Controller
+    # regardless of amount. Bounded back-edge to Ivy on a failed cross-check
+    # (match_retry_exhausted counts the round in the session stash); on exhaustion
+    # it terminates to the Finance-Ops Lead, never loops forever.
     can_call:
-      # Routine: under $5K, confidently coded, no anomaly → AP clerk
-      - agent: "ap_clerk_human"
-        condition: "calling_agent_response.amount_cents < 500000 and calling_agent_response.confidence >= 0.7 and calling_agent_response.anomaly_risk == false"
+      - agent: invoice_intake_agent
+        condition: "calling_agent_response.cross_check_ok == false and calling_agent_response.match_retry_exhausted == false"
+      - agent: finance_ops_lead_human
+        condition: "calling_agent_response.cross_check_ok == false and calling_agent_response.match_retry_exhausted == true"
+      - agent: ap_clerk_human
+        condition: "calling_agent_response.cross_check_ok == true and calling_agent_response.amount_cents < 500000 and calling_agent_response.confidence >= 0.7 and calling_agent_response.anomaly_risk == false"
+      - agent: controller_human
+        condition: "calling_agent_response.cross_check_ok == true and calling_agent_response.amount_cents < 5000000 and (calling_agent_response.amount_cents >= 500000 or calling_agent_response.confidence < 0.7 or calling_agent_response.anomaly_risk == true)"
+      - agent: cfo_human
+        condition: "calling_agent_response.cross_check_ok == true and calling_agent_response.amount_cents >= 5000000"
 
-      # Exception tier: under $50K but >= $5K, OR shaky GL coding,
-      # OR anomaly-flagged → Controller
-      - agent: "controller_human"
-        condition: "(calling_agent_response.amount_cents < 5000000 and (calling_agent_response.amount_cents >= 500000 or calling_agent_response.confidence < 0.7 or calling_agent_response.anomaly_risk == true))"
-
-      # High value: >= $50K → CFO (>= $500K additionally requires dual
-      # sign-off per the policy in cfo_human's prompt)
-      - agent: "cfo_human"
-        condition: "calling_agent_response.amount_cents >= 5000000"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # vendor_comms_agent — ALL vendor-facing correspondence (Rule-2
-  # merge of the exception drafter + the vendor query handler). Mode-dispatched:
-  #   exception_query  — side-arm callable by matching / payment_risk /
-  #                      loan_servicing to ASK the vendor a question
-  #   inquiry_response — ANSWERS vendor inquiries from the
-  #                      vendor_inquiry / payment_status_query /
-  #                      dispute_resolution / tax_form_request entries
-  # ────────────────────────────────────────────────────────────
-  vendor_comms_agent:
-    name: "vendor_comms_agent"
-    agent_type: "llm"
-    description: "Vendor communications — drafts exception queries to vendors/requestors and answers vendor payment-status / dispute inquiries"
-    model: "gpt-4o-mini"
-    temperature: 0.2
-    max_tokens: 1200
-    communication_type: "chain"
-
-    prompt: |
-
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"comms_mode": "", "query_body": "", "query_target": "", "query_recipient": "", "vendor_facing_message": "", "inquiry_type": "", "invoice_state": "", "eta_business_days": 0, "escalation_reason": "", "requires_human_review": false}
-      You are the vendor-communications specialist for this AP team.
-      All correspondence with vendors crosses your desk, in both
-      directions. Your responsibilities:
-
-      1. EXCEPTION QUERIES (comms_mode=exception_query) — when matching
-         or payment-risk found a gap, draft a short, professional query
-         (email to vendor OR internal Slack to the requestor)
-         describing the specific gap and what you need to resolve it.
-         Cite the invoice_id, the offending line(s), and the policy
-         reference if known. Tone: helpful, not accusatory. Include a
-         clear ask. Fill query_body / query_target / query_recipient.
-
-      2. INQUIRY RESPONSES (comms_mode=inquiry_response) — when a
-         vendor asks about payment status, invoice receipt, a dispute,
-         or a tax form, look up the invoice state from the audit log
-         and craft a clear, professional reply. Fill
-         vendor_facing_message (warm, factual, no excuses; cite
-         invoice id + status + ETA if known), inquiry_type
-         (payment_status | dispute | invoice_receipt | credit_memo |
-         other), invoice_state (not_found | received | matched |
-         approved | posted | held_for_review | disputed),
-         eta_business_days (0 if already paid), and escalation_reason
-         when review is needed. Be honest. If we owe them, say so. If
-         we're holding it, explain why. If we never received it, ask
-         them to resend.
-
-      DETERMINISTIC RULES (apply EXACTLY — these are policy):
-        - comms_mode: an explicit comms_mode input wins; a
-          vendor_inquiry payload means inquiry_response; otherwise
-          default to exception_query.
-        - requires_human_review = true whenever ANY of these hold:
-            · the correspondence references fraud, a duplicate,
-              compliance, regulatory matters, or an audit
-            · inquiry_type is "dispute", or invoice_state is
-              "disputed" or "held_for_review"
-            · the vendor_facing_message is under 80 characters
-              (a too-short reply is a quality failure — escalate)
-            · aging > 60 days or a vendor flagged for credit issues
-          Set escalation_reason whenever you set it true.
-        - query_target must be "email" or "slack" (default "email").
-        - inquiry_type must be one of: payment_status | dispute |
-          invoice_receipt | credit_memo | other (default "other").
-        - invoice_state must be one of: not_found | received | matched
-          | approved | posted | held_for_review | disputed (default
-          "not_found").
-        - eta_business_days: integer >= 0 (0 if already paid/unknown).
-
-      Return JSON with ALL of these keys on every reply (fill the keys
-      for the mode you are in; safe defaults for the other mode):
-        - comms_mode: exception_query | inquiry_response
-        - query_body, query_target (email | slack), query_recipient
-        - vendor_facing_message, inquiry_type, invoice_state,
-          eta_business_days, escalation_reason
-        - requires_human_review: boolean
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "vendor_communication"
-
-    yields:
-      comms_mode: "string"              # exception_query | inquiry_response
-      # exception_query mode
-      query_body: "string"
-      query_target: "string"            # email | slack
-      query_recipient: "string"         # vendor email OR internal handle
-      # inquiry_response mode
-      vendor_facing_message: "string"
-      inquiry_type: "string"
-      invoice_state: "string"
-      eta_business_days: "number"
-      escalation_reason: "string"
-      # shared review gate
-      requires_human_review: "boolean"  # true if high-stakes
-
-    inputs:
-      gap_context: "object"             # exception_query mode
-      vendor_inquiry: "object"          # inquiry_response mode
-      comms_mode: "string"              # optional explicit mode override
-
-    context_parts:
-      care: |
-        Vendors are partners. A late payment is bad; a late payment
-        with no answer is worse. Tone: warm + factual. No "we're
-        working on it" without specifics.
-      guardrails: |
-        Never commit to a payment date the AP team hasn't approved.
-        Never expose other vendors' info. Never share internal notes
-        from the audit log verbatim — summarise.
-
-    can_call:
-      # High-stakes (either mode) → AP clerk reviews before sending
-      - agent: "ap_clerk_human"
-        condition: "calling_agent_response.requires_human_review == true"
-
-      # Routine inquiry replies — clerk still reviews but light touch
-      - agent: "ap_clerk_human"
-        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.comms_mode == 'inquiry_response'"
-
-      # Routine exception queries are terminal — the SDK delivery layer
-      # sends the drafted query (a real customer would wire this to an
-      # email/Slack send tool)
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # ap_clerk_human — Tier-1 review (channel-native HITL)
-  # ────────────────────────────────────────────────────────────
-  ap_clerk_human:
-    name: "ap_clerk_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "AP clerk — first-line review for routine invoices under threshold"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 3600         # 1 hour for routine review
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "escalate_to_controller"
-      message: "escalate_to_controller"
-      note: "AP clerk did not respond within timeout — escalating per default-deny policy"
-
-    # Channel adapters — uncomment + set credentials to swap out the inbox.
-    # channels:
-    #   slack:
-    #     bot_token: "${SLACK_BOT_TOKEN:}"
-    #     signing_secret: "${SLACK_SIGNING_SECRET:}"
-    #     listen_channels: ["${SLACK_FIN_OPS_CHANNEL:}"]
-    #     post_channel: "${SLACK_FIN_OPS_CHANNEL:}"
-
-    yields:
-      decision: "string"                # approve | reject | escalate_to_controller | request_clarification
-      notes: "string"
-
-    inputs:
-      invoice_id: "string"
-      vendor_name: "string"
-      amount_cents: "number"
-      gl_account: "string"
-      # (no 'reason' input — the WIRE that routed here is the reason:
-      #  gl_coding's ap_clerk edge fires only under $5K / conf >= 0.7 /
-      #  no anomaly)
-
-    human_prompt_template: |
-      Routine invoice review.
-      Default action is APPROVE unless a clear policy violation.
-      Escalate to Controller for: missing PO, vendor first-time-seen,
-      fraud_score >= 0.4, GL-coding confidence < 0.7.
-
-    can_call:
-      - agent: "erp_poster_agent"
-        # NOTE: human responses arrive with SDK meta fields (human_message,
-        # human_decision, …) — the agent's declared yields are NOT populated
-        # for human agents. Route on human_message; the operator replies
-        # with one of the decision words below (case-tolerant).
-        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'Approve' or calling_agent_response.human_message == 'Approved'"
-
-      - agent: "controller_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_controller' or calling_agent_response.human_message == 'escalate'"
-
-      - agent: "audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'Reject' or calling_agent_response.human_message == 'Rejected'"
-
-  # ────────────────────────────────────────────────────────────
-  # controller_human — Tier-2 sign-off (regulator visibility)
-  # ────────────────────────────────────────────────────────────
-  controller_human:
-    name: "controller_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "Controller — regulated sign-off; exception judgment; close-cycle owner"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 7200         # 2 hours; close-cycle items may sit longer
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "Controller did not respond — workflow paused for manual review (default-deny)"
-
-    yields:
-      decision: "string"                # approve | reject | escalate_to_cfo | halt_for_review
-      notes: "string"
-
-    inputs:
-      invoice_id: "string"
-      vendor_name: "string"
-      amount_cents: "number"
-      flagged_signals: "list"
-      gl_account: "string"
-      # (no 'reason' input — the WIRE is the reason: $5K-$50K, or
-      #  gl confidence < 0.7, or anomaly/fraud escalation)
-
-    human_prompt_template: |
-      Controller review — regulated sign-off.
-      For invoices flagged by payment_risk (>= 0.7), confirm the
-      signal(s) before approving.
-      For invoices >= $50K, dual sign-off may be required (see CFO).
-      Reject only with documented reason — every rejection is auditable.
-
-    can_call:
-      - agent: "erp_poster_agent"
-        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'Approve' or calling_agent_response.human_message == 'Approved'"
-
-      - agent: "cfo_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_cfo' or calling_agent_response.human_message == 'escalate'"
-
-      - agent: "audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'Reject' or calling_agent_response.human_message == 'Rejected' or calling_agent_response.human_message == 'halt_for_review'"
-
-  # ────────────────────────────────────────────────────────────
-  # cfo_human — Tier-3 sign-off (high-value)
-  # ────────────────────────────────────────────────────────────
-  cfo_human:
-    name: "cfo_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "CFO — high-value sign-off and dual-sign for very-high-value invoices"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 14400        # 4 hours
-
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "CFO did not respond — workflow paused (default-deny on high-value items)"
-
-    yields:
-      decision: "string"
-      notes: "string"
-
-    inputs:
-      invoice_id: "string"
-      vendor_name: "string"
-      amount_cents: "number"
-      gl_account: "string"
-      # (no 'reason' input — the WIRE is the reason: amount >= $50K)
-
-    human_prompt_template: |
-      High-value sign-off (>= $50K).
-      For invoices >= $500K, dual sign-off (you AND Controller) is
-      required by policy — the workflow will not auto-post.
-
-    can_call:
-      - agent: "erp_poster_agent"
-        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'Approve' or calling_agent_response.human_message == 'Approved'"
-
-      - agent: "audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'Approve' and calling_agent_response.human_message != 'Approved'"
-
-  # ────────────────────────────────────────────────────────────
-  # erp_poster_agent — programmatic dispatcher to the configured ERP
-  # Implementation: agency/erp_poster_agent.py + agency/_shared/erp_poster.py
-  # KEPT AS PYTHON (class: actuator) — real side effect (ERP write)
-  # with fail-closed post-HITL recovery: the invoice context is
-  # recovered from the session stash that gl_coding wrote before the
-  # human gate; if nothing is recoverable, NOTHING is posted.
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Poe — ERP Poster & Ledger Liaison (programmatic FINISHER). Sits BEHIND the
+  # human approval gate. It never approves or pays — it re-checks that a human
+  # actually approved (allow-token allowlist + block-token denylist; an UNKNOWN
+  # verdict FAILS CLOSED), enforces deterministic invariants a human can't waive
+  # (an invoice on record, a GL account, a positive amount), renders the posting
+  # pack to ./out, DELETES it on a tripped floor, and records an append-only
+  # ledger entry. After the HITL gate the upstream payload is dropped, so Poe
+  # recovers the invoice from the session stash / dev store. See
+  # agency/erp_poster_agent.py for the enforce_posting_floor.
+  # ─────────────────────────────────────────────────────────────────────────
   erp_poster_agent:
-    name: "erp_poster_agent"
-    agent_type: "programmatic"
-    description: "Posts approved invoice to the configured ERP (NetSuite, SAP, QuickBooks, …)"
-    communication_type: "chain"
-
+    name: erp_poster_agent
+    communication_type: chain
+    agent_type: programmatic
+    description: "ERP Poster & Ledger Liaison — re-checks approval, posts the approved entry to the ERP, WORM ledger."
     yields:
-      erp_entry_id: "string"
-      posted_at_utc: "string"
+      approved: "boolean"
       posted: "boolean"
-      erp_type: "string"
-      # Echoed identity — the audit line answers "which invoice posted"
+      erp_entry_id: "string"
+      pack_path: "string"
+      status: "string"              # posted | blocked
+      block_reasons: "array"
       invoice_id: "string"
       vendor_name: "string"
       amount_cents: "number"
-      error: "string"                   # set when posting is refused (fail-closed)
-
-    inputs:
-      invoice_id: "string"
-      gl_account: "string"
-      cost_center: "string"
-      tax_code: "string"
-      amount_cents: "number"
-
     can_call:
-      - agent: "audit_logger_agent"
+      - agent: audit_logger_agent
+        condition: "always"
 
-  # ────────────────────────────────────────────────────────────
-  # audit_logger_agent — external WORM connector (CRITICAL)
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Human members — first-class, reached in the channel they already live in.
+  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
+  # dual belongs on the human/webhook boundary agent ONLY; the AI specialists
+  # above are all `chain` (dual->dual is a footgun the SDK warns on). Humans
+  # never call other humans (that would be dual->dual) — tier selection happens
+  # upstream on Mat's approval matrix, and the Manager SUPERVISOR escalates a
+  # held gate to the Finance-Ops Lead (manager.escalation.targets).
+  # ─────────────────────────────────────────────────────────────────────────
+
+  ap_clerk_human:
+    name: ap_clerk_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 3600     # 1 hour for routine review / a question answer
+    description: "AP Clerk — answers Ivy's targeted questions and signs off routine coding sheets (< $5K)."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+      max_retries: 1
+      retry_delay: 2
+    can_call:
+      - agent: erp_poster_agent
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
+      - agent: invoice_intake_agent
+        condition: "calling_agent_response.human_message == 'answered'"
+      - agent: audit_logger_agent
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
+    yields:
+      human_message: "string"       # approve | answered | reject | held_for_review
+    inputs:
+      question: "string"
+
+  controller_human:
+    name: controller_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 7200     # 2 hours; exception items may sit longer
+    description: "Controller — regulated sign-off for exceptions, $5K-$50K, low-confidence coding, or flagged risk."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+    can_call:
+      - agent: erp_poster_agent
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
+      # On silence/hold or a reject, record it and let the Manager SUPERVISOR
+      # escalate to the Finance-Ops Lead — no hardcoded human->human wire.
+      - agent: audit_logger_agent
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
+    yields:
+      human_message: "string"       # approve | reject | held_for_review
+    inputs:
+      coding_sheet: "object"
+
+  cfo_human:
+    name: cfo_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 14400    # 4 hours
+    description: "CFO — high-value sign-off (>= $50K); dual sign-off policy above $500K."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+    can_call:
+      - agent: erp_poster_agent
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
+      - agent: audit_logger_agent
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
+    yields:
+      human_message: "string"       # approve | reject | held_for_review
+    inputs:
+      coding_sheet: "object"
+
+  finance_ops_lead_human:
+    name: finance_ops_lead_human
+    agent_type: human
+    human_interface: webhook
+    communication_type: dual
+    human_timeout_seconds: 259200   # 3 days
+    description: "Accountable owner — reviews exceptions, owns policy calls, decides every gate. Everything that leaves the pod."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+    can_call:
+      - agent: audit_logger_agent
+        condition: "always"
+    yields:
+      human_message: "string"
+    inputs:
+      exception: "object"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # WORM audit sink — hash-chained, append-only, the terminus of every path.
+  # Registered in main.py via sdk.intelligence("audit_logger_agent").
+  # ─────────────────────────────────────────────────────────────────────────
   audit_logger_agent:
-    name: "audit_logger_agent"
-    agent_type: "external"
-    description: "Writes immutable audit entry — terminus of every flow"
-    framework: "custom"
-    communication_type: "execute"
-
+    name: audit_logger_agent
+    agent_type: external
+    framework: custom
+    communication_type: execute
+    description: "WORM audit — hash-chains every decision, post, approval, and held gate. Terminus."
     connector_config:
-      sink_type: "local_file"
-      local_file_path: "./logs/audit.jsonl"
-      # Production: switch to S3 Object Lock / Datadog audit / Splunk HEC
-      # via agency/_shared/audit_logger.py.
-
-    yields:
-      audit_event_id: "string"
-      written_at_utc: "string"
-      hash_chain_prev: "string"
-      hash_chain_current: "string"
-
-    inputs:
-      session_id: "string"
-      payload: "object"
-
-    can_call: []                        # terminal
-
-  # ────────────────────────────────────────────────────────────
-  # close_cycle_orchestrator_agent — month-end sweep of YOUR ERP
-  # Does NOT participate in the per-invoice flow above.
-  # Connector-only (no Python): the close sweep queries the
-  # system-of-record — your ERP (NetSuite / SAP / QuickBooks /
-  # Dynamics) — for unposted entries + reconciliation gaps via an
-  # MCP server in front of it. The MCP tool returns the declared
-  # yields shape below.
-  # ────────────────────────────────────────────────────────────
-  close_cycle_orchestrator_agent:
-    name: "close_cycle_orchestrator_agent"
-    agent_type: "programmatic"
-    description: "Monthly close-cycle sweep against your ERP (NetSuite/SAP/QuickBooks via MCP) — reconciliation gaps, unposted entries, reporting"
-    communication_type: "execute"
-    # wake_up: "0 23 28-31 * *"         # last day-of-month, 23:00
-    # ^ enable after wiring your ERP connector — a cron sweeping an
-    #   unwired connector just fills the logs with errors. The
-    #   monthly_close entry point still allows manual kicks.
-
-    integration: "mcp"
-    connector_config:
-      transport: "http"
-      url: "${ERP_MCP_URL:}"            # e.g. https://mcp.yourcompany.com/erp
-      auth_token: "${ERP_MCP_TOKEN:}"
-      tool_name: "close_cycle_sweep"    # MCP tool that sweeps unposted entries
-      timeout: 120.0
-
-    yields:
-      gaps_found: "number"
-      gap_invoice_ids: "list"
-      reports_generated: "list"
-
-    inputs:
-      trigger: "string"
-
-    can_call:
-      # If gaps found, escalate to Controller for sign-off
-      - agent: "controller_human"
-        condition: "calling_agent_response.gaps_found > 0"
-
-      # Otherwise terminal — emit close-complete audit entry
-      - agent: "audit_logger_agent"
-        condition: "calling_agent_response.gaps_found == 0"
-
-  # ────────────────────────────────────────────────────────────
-  # payment_scheduler_agent — pay date + early-pay discount capture
-  # Runs after approval, before erp_poster.
-  # Connector-only (no Python): payment-run scheduling is a treasury
-  # decision made by YOUR treasury / ERP payments module (Kyriba,
-  # SAP TRM, NetSuite payment runs, Bill.com) — it owns the payment
-  # calendar, cash position, and discount-capture policy. Expose it
-  # via an MCP server; the tool returns the declared yields below.
-  # ────────────────────────────────────────────────────────────
-  payment_scheduler_agent:
-    name: "payment_scheduler_agent"
-    agent_type: "programmatic"
-    description: "Schedules the payment in your treasury system (Kyriba/SAP TRM/NetSuite/Bill.com via MCP) — optimal pay date + early-payment discount capture"
-    communication_type: "chain"
-
-    integration: "mcp"
-    connector_config:
-      transport: "http"
-      url: "${TREASURY_MCP_URL:}"       # e.g. https://mcp.yourcompany.com/treasury
-      auth_token: "${TREASURY_MCP_TOKEN:}"
-      tool_name: "schedule_payment"     # MCP tool: pay-date + discount-capture decision
-      timeout: 60.0
-
-    yields:
-      recommended_pay_date: "string"
-      due_date: "string"
-      early_pay_discount_capture: "boolean"
-      early_pay_savings_cents: "number"
-      scheduler_briefing: "string"
-    inputs:
-      invoice_date: "string"
-      payment_terms: "string"
-      amount_cents: "number"
-      due_date: "string"
-    can_call:
-      # Always feeds into erp_poster (terminal step in the pay path)
-      - agent: "erp_poster_agent"
-        condition: "true"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # vendor_compliance_agent — ONE compliance officer (Rule-2 merge of
-  # the vendor onboarder + the KYC processor). LLM writes the KYC
-  # narrative + onboarding profile; agency/vendor_compliance_agent.py
-  # owns the deterministic compliance floor a regulator reads:
-  #   @pre_compose load_vendor_context — pulls the on-file vendor-master
-  #     record (ERP in prod) so a re-screen is grounded.
-  #   @chain enforce_compliance_floor — the SANCTIONS / HIGH-RISK-COUNTRY
-  #     / MISSING-TAX-FORM screen (agency/_shared/compliance_screen). ANY
-  #     hit FORCES compliance review — the LLM cannot clear it: a sanctions
-  #     hit → rejected + SAR + risk 1.0; a high-risk jurisdiction →
-  #     enhanced due diligence; onboarding with no valid tax form →
-  #     requires_human_review; onboarded_to_master is allowed True ONLY on
-  #     a fully clean path. The full disposition policy is also stated
-  #     verbatim in the prompt below — auditable by reading this file.
-  #
-  # PRODUCTION NOTE — the vendor master is YOUR ERP's vendor master
-  # (NetSuite / SAP / Coupa), and the authoritative sanctions screen
-  # is your screening provider (Refinitiv World-Check, Dow Jones,
-  # OFAC SDN API). The clean-onboarding path below continues into the
-  # invoice chain; wire the actual master write + screening lookup to
-  # your systems (MCP/n8n connector or the sanctions_lists knowledge
-  # group). A vendor NEVER auto-onboards without an approved KYC.
-  # ────────────────────────────────────────────────────────────
-  vendor_compliance_agent:
-    name: "vendor_compliance_agent"
-    agent_type: "llm"
-    description: "Compliance officer — banking-grade KYC (identity + sanctions + PEP + beneficial owners) plus new-vendor onboarding (tax form + OFAC + bank verify) before first payment"
-    model: "gpt-4o-mini"
-    temperature: 0.0
-    max_tokens: 1500
-    communication_type: "chain"
-
-    prompt: |
-
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"compliance_mode": "", "counterparty_id": "", "legal_name": "", "jurisdiction": "", "entity_type": "", "beneficial_owners_count": 0, "sanctions_hits": [], "pep_status": "", "high_risk_country": false, "risk_score": 0, "overall_status": "", "requires_compliance_review": false, "requires_filing_sar": false, "verified_at_utc": "", "vendor_id": "", "tax_form_kind": "", "missing_fields": [], "ofac_clear": false, "requires_human_review": false, "onboarded_to_master": false, "onboarding_briefing": ""}
-      You are the compliance officer for this finance team. No new
-      counterparty moves money until you have verified them. Your
-      responsibilities:
-
-      1. KYC VERIFICATION (always). Verify the counterparty using
-         authoritative public sources. If unverifiable, leave the
-         field empty rather than guessing — an empty field fails
-         closed downstream. Fill:
-           - legal_name, jurisdiction (2-letter ISO), entity_type
-               (individual | corporate | trust | gov)
-           - beneficial_owners: list of {name, pct, country}
-           - sanctions_hits: list of list-name strings if the entity
-               matches OFAC SDN / EU CONSOL / UK HMT / UN / DFAT / OSFI
-           - pep_status: not_pep | pep | pep_close_associate
-
-      2. VENDOR ONBOARDING (when a new vendor's first invoice arrives).
-         Extract a clean vendor profile from the inbound
-         correspondence. Fill:
-           - vendor_profile: object with these sub-keys:
-               vendor_id: string (proposed id, e.g. v-<slug>-<seq>)
-               legal_name: full legal name
-               country_code: ISO-3166 alpha-2 (US, GB, IN, etc.)
-               tax_form_kind: W-9 / W-8BEN / W-8BEN-E / other
-               tax_form_received_at: ISO-8601 timestamp, empty if not received
-               bank_routing_verified: boolean — true ONLY if the AP team has
-                 confirmed by phone-call callback (never by inbound email alone)
-               spend_limit_cents: integer (recommend initial limit;
-                 50000 cents = $500 default if no signal)
-               ofac_clear: boolean (best-effort — final screen is downstream)
-               notes: list of strings — anything AP should know
-           - onboarding_briefing: 3 sentence narrative for the AP team
-             reviewing this. Lead with the onboarding recommendation
-             (proceed / hold for review / block on OFAC).
-         For a pure-KYC request (a counterparty that is not a vendor —
-         customer, partner, loan applicant), omit vendor_profile.
-
-      DETERMINISTIC POLICY (apply EXACTLY — this is the firm's
-      compliance matrix, not judgment; a regulator reads these rules):
-
-      Mode:
-        - compliance_mode: an explicit compliance_mode input wins; a
-          counterparty_id with no vendor profile in sight → "kyc_only";
-          otherwise → "onboarding". In kyc_only mode leave every
-          onboarding field at its safe default (requires_human_review
-          false, onboarded_to_master false) so the invoice-chain edge
-          never fires.
-
-      KYC risk score (sum, capped at 1.0):
-        - any sanctions hit ............................. score = 1.0
-        - high-risk jurisdiction (IR, KP, SY, CU, RU, BY, MM) → +0.40
-          (also set high_risk_country = true)
-        - any beneficial owner with >= 25% in a high-risk
-          country ........................................ +0.30
-        - pep_status is pep or pep_close_associate ....... +0.25
-        - entity_type is trust ........................... +0.10
-        - corporate with NO beneficial owners listed ..... +0.20
-
-      KYC disposition (fail-closed):
-        - missing counterparty identity → overall_status "pending",
-          risk_score 1.0, requires_compliance_review = true (a missing
-          id is NOT a cleared state)
-        - any sanctions hit → overall_status "rejected",
-          requires_filing_sar = true
-        - risk_score >= 0.40 → overall_status "conditional",
-          requires_compliance_review = true (enhanced due diligence)
-        - otherwise → overall_status "approved"
-
-      Onboarding gate (onboarding mode only):
-        - required-field floor: vendor_id, legal_name, tax_form_kind,
-          country_code, bank_routing_verified — list anything absent
-          in missing_fields and set requires_human_review = true
-        - ofac_clear = false (and requires_human_review = true) on any
-          OFAC/sanctions-list match — never auto-overrideable
-        - onboarded_to_master = true ONLY when overall_status is
-          "approved" AND missing_fields is empty AND ofac_clear is
-          true; in every other case it is false and a human reviews
-        - a vendor NEVER auto-onboards without an approved KYC
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    # groupName choice: sanctions_lists kept (over the absorbed agent's
-    # onboarding-policy group) — the judgment the LLM grounds is the
-    # sanctions / PEP screen; the onboarding floor is deterministic in
-    # the module.
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "sanctions_lists"
-
-    yields:
-      compliance_mode: "string"          # onboarding | kyc_only — drives edges
-      # KYC responsibility
-      counterparty_id: "string"
-      legal_name: "string"
-      jurisdiction: "string"
-      entity_type: "string"
-      beneficial_owners_count: "number"
-      sanctions_hits: "list"
-      pep_status: "string"
-      high_risk_country: "boolean"
-      risk_score: "number"
-      overall_status: "string"
-      requires_compliance_review: "boolean"
-      requires_filing_sar: "boolean"
-      verified_at_utc: "string"
-      # onboarding responsibility
-      vendor_id: "string"
-      tax_form_kind: "string"
-      missing_fields: "list"
-      ofac_clear: "boolean"
-      requires_human_review: "boolean"
-      onboarded_to_master: "boolean"
-      onboarding_briefing: "string"
-
-    inputs:
-      upstream_yields: "object"
-      counterparty_id: "string"
-      compliance_mode: "string"          # optional explicit mode override
-
-    can_call:
-      # Sanctions hit → mandatory SAR filing
-      - agent: "controller_human"
-        condition: "calling_agent_response.requires_filing_sar == true"
-
-      # Conditional KYC → enhanced due diligence by compliance
-      - agent: "controller_human"
-        condition: "calling_agent_response.requires_compliance_review == true and calling_agent_response.requires_filing_sar == false"
-
-      # OFAC fail OR missing fields OR unapproved KYC → AP clerk review
-      # (never auto-onboard)
-      - agent: "ap_clerk_human"
-        condition: "calling_agent_response.requires_human_review == true"
-
-      # Clean, KYC-approved profile written to master → continue to
-      # invoice_intake for the first invoice in the chain. Mode-guarded
-      # so a pure-KYC counterparty (loan applicant, customer) never
-      # enters the invoice chain.
-      - agent: "invoice_intake_agent"
-        condition: "calling_agent_response.requires_human_review == false and calling_agent_response.compliance_mode == 'onboarding'"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # loan_origination_agent — credit decisioning for internal-credit programs
-  # ────────────────────────────────────────────────────────────
-  loan_origination_agent:
-    name: "loan_origination_agent"
-    agent_type: "programmatic"
-    description: "Loan application → credit signals → policy → decision (auto / manager / cfo / board tiers)"
-    communication_type: "chain"
-
-    yields:
-      application_id: "string"
-      applicant_id: "string"
-      applicant_type: "string"
-      amount_cents: "number"
-      term_months: "number"
-      decision: "string"
-      approval_tier: "string"
-      decision_rationale: "string"
-      decline_reasons: "list"
-      credit_signals: "object"
-      requires_manual_approval: "boolean"
-      decided_at_utc: "string"
-
-    inputs:
-      upstream_yields: "object"
-      application_id: "string"
-
-    narration: |
-      Auto-approve threshold: $50K. Manager: $50K-$250K. CFO: $250K-$1M.
-      Board: $1M+. Hard policy gates:
-        · KYC status must be approved
-        · Individual: FICO ≥ 680, DTI ≤ 0.45
-        · Corporate: DSCR ≥ 1.20, rating ≥ BB
-
-    can_call:
-      - agent: "controller_human"
-        condition: "calling_agent_response.approval_tier == 'manager' and calling_agent_response.requires_manual_approval == true"
-
-      - agent: "cfo_human"
-        condition: "calling_agent_response.approval_tier == 'cfo' and calling_agent_response.requires_manual_approval == true"
-
-      # Board-tier escalation → CFO first then up
-      - agent: "cfo_human"
-        condition: "calling_agent_response.approval_tier == 'board' and calling_agent_response.requires_manual_approval == true"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # loan_servicing_agent — day-2 ops + daily delinquency sweep
-  # ────────────────────────────────────────────────────────────
-  loan_servicing_agent:
-    name: "loan_servicing_agent"
-    agent_type: "programmatic"
-    description: "Loan payment posting, payoff quotes, daily delinquency bucket sweep"
-    communication_type: "chain"
-    wake_up: "0 5 * * *"            # Daily 05:00 sweep
-
-    yields:
-      action: "string"               # post_payment | payoff_quote | delinquency_sweep
-      loan_id: "string"
-      posted: "boolean"
-      posting_id: "string"
-      amount_cents: "number"
-      interest_part_cents: "number"
-      principal_part_cents: "number"
-      new_balance_cents: "number"
-      loan_paid_off: "boolean"
-      next_payment_due_utc: "string"
-      outstanding_principal_cents: "number"
-      accrued_interest_cents: "number"
-      payoff_cents: "number"
-      valid_through_utc: "string"
-      swept_at_utc: "string"
-      bucket_movements: "object"
-      current_count: "number"
-      early_dpd_count: "number"
-      delinquent_count: "number"
-      default_count: "number"
-      chargeoff_count: "number"
-      requires_collections_team: "boolean"
-      requires_writeoff_review: "boolean"
-
-    inputs:
-      mode: "string"
-      upstream_yields: "object"
-      loan_id: "string"
-      payment_amount_cents: "number"
-
-    can_call:
-      - agent: "controller_human"
-        condition: "calling_agent_response.requires_writeoff_review == true"
-
-      - agent: "vendor_comms_agent"
-        condition: "calling_agent_response.requires_collections_team == true"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # regulatory_monitor_agent — daily reg-feed scan with process taxonomy.
-  # LLM pulls + classifies + dedupes the feed items; micro-module
-  # (agency/regulatory_monitor_agent.py) owns the FILING TRIGGER:
-  #   @chain enforce_urgency_floor — recomputes new_alerts_count +
-  #     alerts_by_urgency from the actual alert list and FORCES
-  #     requires_compliance_review when ANY new alert is immediate/high
-  #     (the controller escalation rides on it — the LLM cannot summarise
-  #     a high-urgency change without tripping the review gate).
-  #   (No @pre_compose: the dedup source of truth is the SDK cross-session
-  #    memory below, not deterministically readable here — adding one
-  #    would be theater.)
-  # ────────────────────────────────────────────────────────────
-  regulatory_monitor_agent:
-    name: "regulatory_monitor_agent"
-    agent_type: "llm"
-    description: "Watches SEC/FinCEN/IRS/EU/state feeds; classifies impact to finance processes"
-    model: "gpt-4o-mini"
-    temperature: 0.0
-    max_tokens: 2500
-    communication_type: "chain"
-    wake_up: "0 7 * * *"
-
-    prompt: |
-
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-
-      {"new_alerts_count": 0, "new_alerts": [], "alerts_by_urgency": {}, "skipped_duplicates": 0, "requires_compliance_review": false, "swept_at_utc": ""}
-      Pull today's new regulatory items from configured feeds.
-      For each item build an alert object:
-        - alert_id (deterministic from source + date)
-        - source (SEC | FinCEN | IRS | EU | state)
-        - jurisdiction (2-letter)
-        - title, summary (≤ 500 chars)
-        - effective_date (ISO)
-        - url
-        - process_areas: which finance processes it touches, using the
-          regulatory_taxonomy knowledge group plus these keyword rules:
-            ap_payments: payment, wire, ach, remittance, ofac
-            ar_revenue:  revenue recognition, asc 606, ifrs 15
-            tax:         irs, tax notice, rev proc, section 174
-            lending:     reg b, tila, respa, dodd-frank, fair lending
-            aml:         aml, anti-money laundering, sar, ctr, bsa
-            kyc:         kyc, cdd, beneficial ownership, fincen rule
-            audit:       audit, soc 1, soc 2, internal control
-            data:        gdpr, ccpa, personal data, data subject
-            esg:         climate disclosure, sfdr, csrd, scope 3
-          DROP items matching no process area — not relevant to us.
-        - urgency: "immediate" when effective within 30 days AND
-          mandatory/effective-immediately language; "high" when
-          effective within 30 days; "medium" within 90 days;
-          "low" otherwise (or when no effective date is parseable).
-
-      DEDUPLICATION: compare against the alerts you reported on
-      previous runs (your cross-session memory holds them). Count any
-      already-reported alert_id in skipped_duplicates and EXCLUDE it
-      from new_alerts.
-
-      Then fill the final shape:
-        - new_alerts: the deduped, relevant alert objects
-        - new_alerts_count: its length
-        - alerts_by_urgency: counts keyed by urgency level
-        - requires_compliance_review: true when ANY new alert is
-          "immediate" or "high"
-        - swept_at_utc: ISO-8601 UTC timestamp of this sweep
-
-    enforce_yields: true
-
-    # Cross-session memory replaces the old SQLite dedup store — the
-    # agent remembers what it already reported across daily runs.
-    memory:
-      cross_session: true
-      cross_session_limit: 100
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "regulatory_taxonomy"
-
-    yields:
-      new_alerts_count: "number"
-      new_alerts: "list"
-      alerts_by_urgency: "object"
-      skipped_duplicates: "number"
-      requires_compliance_review: "boolean"
-      swept_at_utc: "string"
-
-    inputs:
-      trigger: "string"
-
-    can_call:
-      - agent: "controller_human"
-        condition: "calling_agent_response.requires_compliance_review == true"
-
-    auto_store_response: true
-    auto_store_yields: true
+      sink_type: local_file
+      local_file_path: "./logs/finance_audit.jsonl"
+    can_call: []

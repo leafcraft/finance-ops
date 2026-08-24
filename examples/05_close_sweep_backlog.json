@@ -1,0 +1,8 @@
+{
+  "_entry_point": "daily_close_sweep",
+  "_description": "Month-end close sweep. Ivy fans across the aging backlog via `instances` — each parallel copy calls claim_next_invoice to pull a DISJOINT invoice, so the backlog is drained with no double-work.",
+  "data": {
+    "trigger": "daily_close_sweep",
+    "message": "Month-end close — sweep the unposted backlog."
+  }
+}

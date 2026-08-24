@@ -1,0 +1,8 @@
+{
+  "_entry_point": "email_invoice",
+  "_description": "A vendor emails a services invoice ($80K, Initech consulting — no PO receipt needed). Ivy extracts, Mat codes; at >= $50K the approval matrix routes it to the CFO, then Poe posts.",
+  "data": {
+    "source_ref": "evt-initech-4410",
+    "message": "Invoice from Initech Consulting for the advisory engagement."
+  }
+}
