@@ -14,6 +14,13 @@ concrete "@chain fails closed":
      half-posted entry.
   d) dev-store recovery — after the HITL gate the upstream payload is dropped,
      so Poe recovers the coded invoice from the session stash / dev store.
+  e) DUAL SIGN-OFF above $500,000 (DUAL_SIGNOFF_CENTS). Each approval is
+     recorded in the sign-off register (store.record_signoff: which seat, which
+     person). With the CFO's approval alone Poe posts nothing and returns
+     status `awaiting_second_signature` — config routes that to the Controller.
+     It posts only when the CFO AND the Controller approved, and blocks when
+     one person signed both (segregation of duties) or no CFO approval is on
+     record.
 """
 from __future__ import annotations
 
@@ -37,6 +44,12 @@ except ImportError:  # pragma: no cover
 logger = LeafMeshLogger(__name__)
 
 _OUT_DIR = Path("./out")
+# Dual sign-off policy: an entry ABOVE this amount needs two signers. Must match
+# the README / PRD and the Mat matrix comment in configs/config.yaml.
+DUAL_SIGNOFF_CENTS = 50_000_000          # $500,000
+FIRST_SIGNER = "cfo_human"
+SECOND_SIGNER = "controller_human"
+AWAITING = "awaiting_second_signature"
 _APPROVE_TOKENS = frozenset({"approve", "approved", "sign", "signed", "yes", "ok"})
 _BLOCK_TOKENS = frozenset({"reject", "rejected", "no", "deny", "denied",
                            "held", "held_for_review", "hold", "halt"})
@@ -67,6 +80,58 @@ def _is_approved(input_data: dict) -> bool:
 
 def _is_blocked(input_data: dict) -> bool:
     return _signal(input_data) in _BLOCK_TOKENS
+
+
+def _reply_field(input_data: dict, key: str) -> str:
+    """A field of the human reply (source_agent / operator_id), shape-tolerant."""
+    sources = [input_data]
+    up = input_data.get("upstream_yields")
+    if isinstance(up, dict):
+        sources.append(up)
+        sources.extend(v for v in up.values() if isinstance(v, dict))
+    for src in sources:
+        val = src.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+# Values that name nobody in particular (the Inbox's fallback when a reply
+# carries no login).
+_UNKNOWN_SIGNERS = frozenset({"", "operator", "system", "unknown", "anonymous"})
+
+
+def _check_dual_signoff(inv_id: str, input_data: dict) -> tuple[str, list[str], list[str]]:
+    """Record this approval and decide: ("post" | "await" | "block", signed_by, reasons).
+
+    The seat comes from the reply's `source_agent` (the SDK stamps the human
+    seat's name on every reply); the person from `operator_id`.
+    """
+    seat = _reply_field(input_data, "source_agent")
+    operator = _reply_field(input_data, "operator_id")
+    rows = store.record_signoff(inv_id, seat, operator)
+    seats = {r["seat"] for r in rows if r.get("seat")}
+    signed_by = sorted(seats)
+    if FIRST_SIGNER not in seats:
+        return "block", signed_by, [f"above ${DUAL_SIGNOFF_CENTS/100:,.0f} the CFO must approve first; "
+                                    f"no CFO approval on record"]
+    if SECOND_SIGNER not in seats:
+        return "await", signed_by, []
+    # Dual control needs to know WHO signed: the Inbox records the person
+    # only when the reply carries their login (operator_id). An unknown or
+    # generic signer cannot prove two different people, so it never posts.
+    people = {s: {str(r.get("operator_id") or "").strip().lower() for r in rows
+                  if r.get("seat") == s} - _UNKNOWN_SIGNERS
+              for s in (FIRST_SIGNER, SECOND_SIGNER)}
+    unknown = [s for s in (FIRST_SIGNER, SECOND_SIGNER) if not people[s]]
+    if unknown:
+        return "block", signed_by, [f"who signed as {', '.join(unknown)} is not recorded — dual "
+                                    f"sign-off needs both signers identified (give each seat its "
+                                    f"operator_ids so the Inbox records the person)"]
+    if people[FIRST_SIGNER] & people[SECOND_SIGNER]:
+        return "block", signed_by, ["the same person signed as CFO and Controller "
+                                    "(two different people must sign)"]
+    return "post", signed_by, []
 
 
 def _recover_invoice(input_data: dict, context: dict) -> dict[str, Any]:
@@ -124,6 +189,8 @@ def enforce_posting_floor(result: Any, context: dict) -> dict:
         result["status"] = "blocked"
         if _is_blocked(input_data):
             result["block_reasons"].append("approver rejected / held")
+            # A rejection or hold voids earlier signatures on this invoice.
+            store.clear_signoffs(str(inv.get("invoice_id") or ""))
         else:
             result["block_reasons"].append("no explicit approval on record (fail closed)")
         _delete_partial(result)
@@ -141,12 +208,34 @@ def enforce_posting_floor(result: Any, context: dict) -> dict:
         reasons.append("no GL account on the coded entry")
     if amount_cents <= 0:
         reasons.append("amount is not positive")
+    if inv_id and any(r.get("invoice_id") == inv_id
+                      for r in store.posted_for_vendor(str(inv.get("vendor_id") or ""))):
+        reasons.append("this invoice is already in the posted ledger (never post twice)")
     if reasons:
         result.update(status="blocked", approved=False, posted=False)
         result["block_reasons"].extend(reasons)
         _delete_partial(result)
         logger.error(f"[poe] REFUSING to post {inv_id or '?'}: {reasons}")
         return result
+
+    # Dual sign-off above $500K — two different signers before anything posts.
+    if amount_cents > DUAL_SIGNOFF_CENTS:
+        verdict, signed_by, dual_reasons = _check_dual_signoff(inv_id, input_data)
+        result["signed_by"] = signed_by
+        if verdict == "await":
+            result.update(status=AWAITING, posted=False, awaiting_signer=SECOND_SIGNER)
+            logger.info(f"[poe] {inv_id} above dual sign-off threshold — CFO signed, "
+                        f"routing to {SECOND_SIGNER} as second signer")
+            return result
+        if verdict == "block":
+            result.update(status="blocked", approved=False, posted=False)
+            result["block_reasons"].extend(dual_reasons)
+            _delete_partial(result)
+            logger.error(f"[poe] REFUSING to post {inv_id}: {dual_reasons}")
+            return result
+    else:
+        seat = _reply_field(input_data, "source_agent")
+        result["signed_by"] = [seat] if seat else []
 
     # Passed the floor — post to the ERP, render the pack, record the ledger.
     posted = dispatch_erp(config={}, payload={
@@ -176,6 +265,7 @@ async def erp_poster_agent(llm_response: Any, input_data: dict, context: dict) -
     out: dict[str, Any] = {
         "approved": _is_approved(input_data), "posted": False, "erp_entry_id": "",
         "pack_path": "", "status": "", "block_reasons": [],
+        "signed_by": [], "awaiting_signer": "",
         "invoice_id": str(inv.get("invoice_id") or ""),
         "vendor_name": str(inv.get("vendor_name") or ""),
         "amount_cents": _to_int(inv.get("amount_cents")),

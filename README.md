@@ -26,7 +26,8 @@ claiming a different invoice. **Ray** checks it against the posted ledger before
 anyone codes it, so the re-submission is caught, not paid. **Mat** matches the PO
 and the goods receipt with fixed-tolerance arithmetic, codes it against the live
 chart of accounts, and cross-checks the totals before a human sees the sheet. The
-approval matrix routes it to the *right* signer by amount. Only after a real human
+approval matrix routes it to the *right* signer by amount; above $500K it needs
+two signers, the CFO and then the Controller. Only after a real human
 approval does **Poe** post it — and Poe re-checks that approval, refuses to post
 on silence, and deletes a half-written pack if anything trips. **Cora** answers
 "where is this invoice?" from the case record the whole time.
@@ -41,8 +42,15 @@ model's mood. **Mat cross-checks** before anyone sees the sheet and returns to I
 on a mismatch (bounded — one round, then it terminates to the Lead) rather than
 balancing the books itself. **Poe re-checks that a human actually approved**
 before it posts anything, and **deletes a half-posted pack** if its floor trips.
-**Silence never advances an invoice** — every gate default-denies to
-`held_for_review` and lands in the audit sink. Every decision, post, and approval
+**Silence never advances an invoice.** If nobody answers a gate within its reply
+window, the request waits no longer: its Inbox card closes and the ticket records
+that no reply came. Nothing is approved or posted on silence, and nobody is
+chased automatically. **Above $500K two people sign** — Poe records the CFO's
+approval, routes the entry to the Controller, and posts only with both
+signatures from two different, identified people. Name each seat's people
+(`operator_ids` on `cfo_human` and `controller_human`, their Studio logins) so
+the Inbox records who signed; if it can't tell who signed, Poe refuses to post.
+A rejection or hold voids the earlier signature. Every decision, post, and approval
 is hash-chained into a WORM ledger a regulator can replay. ROI: the AP clerk's
 keying and chasing time collapses, mis-codes and double-pays are caught before
 the money moves, and month-end close stops being a fire drill.
@@ -52,18 +60,32 @@ the money moves, and month-end close stops being a fire drill.
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
 | `fin_coordinator_agent` | Finance-Ops Coordinator | Owns the case end to end; opens it, keeps live status, is the requester's one contact | LLM; orchestrates Ivy→Ray→Mat→Poe; routes exceptions to the Lead; **never extracts, codes, or approves** |
-| `invoice_intake_agent` | Invoice Intake & Extraction Analyst | Reads each invoice with a confidence score, classifies AP/AR/close, runs the policy pre-check | LLM + **super_agent** + **playbook** (AP/AR/close lanes) + **instances** (backlog fan-out with an atomic claim tool) + intake tools; `@chain` **confidence floor** (fail closed) |
+| `invoice_intake_agent` | Invoice Intake & Extraction Analyst | Reads each invoice with a confidence score, classifies AP/AR/close, runs the policy pre-check | LLM + **super_agent** + **playbook** (AP/AR/close lanes) + **scaling.copies** (3 copies, backlog fan-out with an atomic claim tool) + intake tools; `@chain` **confidence floor** (fail closed) |
 | `payment_risk_agent` | Payment-Risk Officer | Duplicate ledger pre-flight + fraud/anomaly verdict from vendor history | LLM; `@chain` **dedupe floor** — a confirmed duplicate is forced to controller review |
 | `matching_gl_agent` | Matching & GL-Coding Builder | PO/3-way match + GL coding; cross-checks totals tie out; renders the coding sheet | LLM + **playbook**; `@chain` **cross-check floor**; bounded back-edge to Ivy; renders the draft to `./out`; approval matrix on its wires |
 | `erp_poster_agent` | ERP Poster & Ledger Liaison | Re-checks approval, posts the approved entry to the ERP, records the ledger | Programmatic **finisher**; approve-token re-check → invariants → post + render pack → **delete-on-block** → WORM ledger |
 | `finance_ops_lead_human` | Accountable owner (Human) | Reviews exceptions, owns policy calls, decides every gate | Human gate — everything that leaves the pod |
 | `ap_clerk_human` | AP Clerk (Human) | Answers Ivy's questions; signs off routine coding sheets (< $5K) | Human gate |
-| `controller_human` | Controller (Human) | Regulated sign-off for exceptions, $5K–$50K, low-confidence coding, flagged risk | Human gate |
-| `cfo_human` | CFO (Human) | High-value sign-off (≥ $50K); dual sign-off above $500K | Human gate |
+| `controller_human` | Controller (Human) | Regulated sign-off for exceptions, $5K–$50K, low-confidence coding, flagged risk; second signer above $500K | Human gate |
+| `cfo_human` | CFO (Human) | High-value sign-off (≥ $50K); first of two signers above $500K (enforced by Poe) | Human gate |
 | `audit_logger_agent` | WORM audit | Hash-chains every decision, post, approval, and held gate | External (custom sink); terminus |
 
-The **LeafMesh Manager** supervises — it reads every hand-off and escalates
-stalls / policy calls / approval timeouts to the Finance-Ops Lead automatically.
+Reply windows (`human_timeout_seconds`): AP Clerk 4 working hours, Controller
+8 working hours (one business day), CFO 24 hours, Finance-Ops Lead 3 days. When a
+window passes with no answer, the Inbox card closes and the ticket records that
+no reply came; nothing is approved, posted or escalated on silence.
+
+The **LeafMesh Manager** supervises. It escalates to the Finance-Ops Lead when an
+agent fails with an error a retry cannot fix (auth, bad request, credit, bad
+config), when 5 different agents fail in one session, or when restarts run out.
+A broken hand-off contract raises an alert only. Policy flags, possible
+duplicates and an exhausted re-match reach the Lead on the agents' own wires.
+
+Ivy's three copies split the close backlog with her own atomic claim tool
+(`claim_next_invoice`). leafmesh 2.4.484's `scaling.copies.mode: auto` with
+`claim_tool:` could replace this manual split (the mesh would claim each item and
+start a copy only when there is one); that switch is the owner's decision and is
+not made in this template.
 
 ## Prerequisites — what to set, in three tiers
 
@@ -79,17 +101,23 @@ stand-ins that **announce themselves** until you wire Tier 2.
 | `ANTHROPIC_API_KEY` | Ivy + Mat (Claude) | **Required.** |
 | `OPENAI_API_KEY` | Cora + Ray + Manager (`gpt-4o-mini`) | **Required** unless you change the models. |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. `docker run -d -p 6379:6379 redis:7-alpine`. |
-| `HITL_OUTBOUND_URL` | Where human members are notified | Defaults to a local stub. |
+| *(no setting)* — human members | Human approvals | Answer in Studio's Inbox. To notify an external tool instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat. |
 
-### Tier 2 — real invoice connectors (set the URL, uncomment the `mcp` block)
-| Setting | Enables |
+### Tier 2 — real invoice connectors (a vault connection, then uncomment the `mcp` block)
+| Vault connection (Infrastructure → Integrations → MCP) | Enables |
 |---|---|
-| `ERP_MCP_URL` / `_TOKEN` | Real invoice / PO / goods-receipt reads from your ERP |
-| `MAIL_MCP_URL` / `_TOKEN` | Real invoice emails + attachments |
+| `erp_mcp` — your ERP's MCP server (address + token) | Real invoice / PO / goods-receipt reads from your ERP |
+| `mail_mcp` — your mailbox's MCP server (address + token) | Real invoice emails + attachments |
 
-> ⚠️ The SDK rejects an `mcp` block with an **empty** URL at load, so the block
-> ships **commented** on `invoice_intake_agent` in `configs/config.yaml`. Fill the
-> URL, then uncomment.
+> The server address and token are entered **only in the vault** — the SDK
+> refuses a `url:` / `token:` written in the config (even as `${ENV_VAR}`). The
+> `mcp` block ships **commented** on `invoice_intake_agent` in
+> `configs/config.yaml`, already picking `connection: erp_mcp` /
+> `connection: mail_mcp`: create the connections, then uncomment — in the file
+> before the first start, in Studio's YAML editor after it (applies live, no
+> restart; see *Changing the configuration after the first start*). Nothing goes
+> in `.env`: the dev tools in `agency/tools.py` check whether the vault record
+> `erp_mcp` or `mail_mcp` exists and, once it does, stop pointing at the seed store.
 
 ### Tier 3 — direct ERP posting replaces the dev SQLite ledger.
 Going live = swap the function bodies in `agency/_shared/erp_poster.py` (the post)
@@ -116,8 +144,20 @@ curl -X POST http://127.0.0.1:18820/api/mesh/request \
 ```
 
 `evt-acme-2207` is a deliberate re-submission of an already-posted invoice — watch
-Ray's dedupe floor force it to a controller review rather than pay it twice. On
-approval, Poe posts to the dev ERP ledger and renders the pack to `./out/`.
+Ray's dedupe floor force it to a controller review rather than pay it twice. The
+approval request lands in **Studio → Inbox** — answer it there. On approval, Poe posts to the dev ERP ledger and renders the pack to `./out/`.
+
+Other seed invoices to try (`source_ref`), one per route:
+
+| `source_ref` | Amount | What happens |
+|---|---|---|
+| `evt-acmecloud-0142` | $4,200 | Clean match → AP Clerk → posted |
+| `evt-acme-2291` | $980 | No PO cited, vendor requires one → back to Ivy once → Finance-Ops Lead |
+| `evt-quint-0099` | $1,440 | Bills 12 desks, PO says 10 → match fails → Ivy → Lead |
+| `evt-globex-9001` | $12,000 | Goods receipt short 8 pallets → 3-way match fails |
+| `evt-initech-4410` | $80,000 | 16 advisory days, service entry sheet accepted → CFO |
+| `evt-snowmelt-0007` | $250,000 | Two-line licence + support → risk screen → CFO |
+| `evt-kestrel-0210` | $642,500 | Above $500K → CFO, then Controller as second signer → posted |
 
 > Packaging note: `pip install leafmesh` (core) includes all LLM providers and
 > runs the pod. For the real ERP/mail connectors add `leafmesh[mcp]`. Avoid
@@ -128,3 +168,33 @@ approval, Poe posts to the dev ERP ledger and renders the pack to `./out/`.
 
 *Built with `create-leafmesh`. The config is the department; the PRD is the brief.*
 *Design doctrine: `.claude/skills/leafmesh/building-agents-thoroughly.md`.*
+
+## Changing the configuration after the first start
+
+`configs/config.yaml` is only the first-start seed. On the first start (an empty store) the agency imports it as version 1 and from then on keeps its configuration in the store. After that the file is not read again: an edit to it is **not** applied, even after a restart (the boot log says "that edit was NOT applied").
+
+To change a running agency:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.) So wherever this README or a comment says "uncomment X in `configs/config.yaml`", do it in the file before the first start, or in Studio's YAML editor after it.
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in `configs/config.yaml`. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).
