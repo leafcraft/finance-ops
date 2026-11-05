@@ -4,11 +4,12 @@
 # end to end: invoice arrives -> extracted (confidence-scored, AP/AR/close
 # classified) -> duplicate + fraud screen -> matched + GL-coded (form built,
 # cross-checked) -> approval tier (clerk / controller / CFO) -> posted to the
-# ERP -> live status. The month-end close sweep fans the same intake across the
-# aging backlog.
+# ERP -> live status. Above $500K an entry needs two signers (CFO first, then
+# the Controller) before it posts. The month-end close sweep fans the same
+# intake across the aging backlog.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off
-# is a finished contract; every human gate default-denies on silence; the
+# is a finished contract; nothing is approved or posted on silence; the
 # finisher posts the real entry and fails closed; the WORM sink is the terminus.
 # Systems (email / vendor portal / ERP) are TOOLS inside agents, never members.
 #
@@ -23,20 +24,15 @@ environment: development
 debug: true
 log_level: INFO
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    password: "${REDIS_PASSWORD:}"
-
 auto_discover:
   directory: ./agency
   pattern: '*_agent.py'
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates
-# stalls / contract violations / repeated errors to the Finance-Ops Lead. It is
-# not a router in the middle of the team.
+# The Manager is the SUPERVISOR. It escalates to the Finance-Ops Lead when an
+# agent fails with an error that a retry cannot fix (auth, bad request, credit,
+# bad config), when 5 different agents fail in one session, or when restarts
+# run out. A broken hand-off contract only raises an alert. It does not chase
+# an unanswered approval. It is not a router in the middle of the team.
 manager:
   model: gpt-4o-mini
   domain: generic
@@ -45,11 +41,10 @@ manager:
     close. A successful invoice flows arrival -> Ivy (extract, confidence-scored,
     AP/AR/close classified) -> Ray (duplicate + fraud screen) -> Mat (PO/3-way
     match + GL coding, cross-checked) -> the right approval tier (AP clerk /
-    Controller / CFO) -> Poe (post to the ERP), and Cora keeps live status.
-    Escalate to the Finance-Ops Lead when: an invoice loops on re-matching more
-    than its bound, a policy flag or possible duplicate is raised, an approval
-    round times out, or any agent hands off a malformed artifact. Silence never
-    advances an invoice.
+    Controller / CFO; above $500K the CFO and then the Controller) -> Poe (post
+    to the ERP), and Cora keeps live status. Policy flags, possible duplicates
+    and a re-match that is still wrong after one retry go to the Finance-Ops
+    Lead on the agents' own wires. Nothing is approved or posted on silence.
   routing:
     mode: static
   escalation:
@@ -59,10 +54,6 @@ manager:
     auto_escalate:
       max_retries: 3
       max_errors_per_session: 5
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 150
 
 # 2.4.131 runtime block — the ONE non-default this pod genuinely needs:
 # extracting a dense multi-line invoice (and a fanned close sweep) can run long.
@@ -70,6 +61,7 @@ mesh:
 # defaults). NOTE: `timeouts` is rejected by <=2.4.130 — it must land WITH the
 # 2.4.131 floor, never before.
 timeouts:
+  mesh_call_default_timeout_s: 150
   llm_hard_timeout_s: 300
 
 # ── Entry points — one per real-world trigger ────────────────────────────────
@@ -150,7 +142,7 @@ agents:
   # the AP clerk, never a guess into a coding sheet. Loops its tools (read
   # sources) until the extract is CLEAN, then hands verified line-items to Ray /
   # Mat (contract). super_agent = autonomous plan/execute/verify across a dense
-  # invoice; @chain = the confidence floor (fail closed). instances = the close
+  # invoice; @chain = the confidence floor (fail closed). scaling.copies = the close
   # sweep fans the SAME analyst across the aging backlog, each copy claiming a
   # disjoint invoice via the atomic claim tool.
   # ─────────────────────────────────────────────────────────────────────────
@@ -175,9 +167,12 @@ agents:
     # from the sweep backlog via claim_next_invoice (atomic). `each` routes every
     # copy on its OWN yields (so each claimed invoice flows independently — a
     # per-invoice request simply has copies 2..N claim nothing and route nothing).
-    # For a pure one-invoice-at-a-time deployment, set instances: 1.
-    instances: 3
-    instances_handoff: each
+    # For a pure one-invoice-at-a-time deployment, set copies.count: 1.
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3
+        handoff: each
     prompt: |
       You are Ivy, the Invoice Intake & Extraction Analyst. Your job is to turn a
       raw invoice into confidence-scored, source-traced line-items — and to
@@ -203,9 +198,9 @@ agents:
     yields:
       extract_clean: "boolean"
       doc_class: "string"            # ap_invoice | ar_invoice | close_item
-      low_confidence_fields: "array"
-      policy_flags: "array"
-      line_items: "array"
+      low_confidence_fields: {type: array, items: string}   # field names, e.g. "line_2.amount"
+      policy_flags: {type: array, items: string}            # e.g. "first_time_vendor"
+      line_items: {type: array, items: object}              # one object per invoice line (sku, description, quantity, unit_price, total, <field>_confidence)
       invoice_id: "string"
       vendor_id: "string"
       amount_cents: "number"
@@ -259,20 +254,20 @@ agents:
     # (available:false) when it has no real source. See agency/tools.py.
     tools: [read_invoice_sources, read_po_context, list_prior_invoices, claim_next_invoice]
     tool_categories: [intake]
-    # ── To wire real email / ERP, uncomment and set the URLs (each named action
-    #    under `use:` becomes its own tool, e.g. erp_read_invoice). NOTE: the SDK
-    #    rejects an http mcp block with an EMPTY url at load, so this ships
-    #    commented — fill the URL, then uncomment. ──
+    # ── To wire real email / ERP: create the vault connections 'erp_mcp' and
+    #    'mail_mcp' on Infrastructure → Integrations → MCP (each an MCP server's
+    #    connection: its address + token), then uncomment — here before the first
+    #    start, in Studio's YAML editor after it (applies live, no restart). Each named action
+    #    under `use:` becomes its own tool, e.g. erp_read_invoice. The address
+    #    and token live only in the vault — never write url:/token: here. ──
     # mcp:
-    #   - transport: http
-    #     url: "${ERP_MCP_URL}"
-    #     token: "${ERP_MCP_TOKEN:}"
+    #   - connection: erp_mcp
+    #     transport: http
     #     use: [read_invoice, read_po, read_goods_receipt]
     #     name: erp
     #     timeout: 30
-    #   - transport: http
-    #     url: "${MAIL_MCP_URL}"
-    #     token: "${MAIL_MCP_TOKEN:}"
+    #   - connection: mail_mcp
+    #     transport: http
     #     use: [read_messages, read_attachments]
     #     name: mail
     #     timeout: 30
@@ -323,7 +318,7 @@ agents:
        "duplicate_of_invoice_id": ..., "recommendation": ..., "briefing": ...}
     yields:
       fraud_score: "number"          # 0..1
-      flagged_signals: "array"
+      flagged_signals: {type: array, items: string}   # e.g. "round_number", "bank_details_changed"
       is_duplicate: "boolean"
       duplicate_of_invoice_id: "string"
       recommendation: "string"       # pass | flag | controller_review
@@ -407,6 +402,9 @@ agents:
     #   AP clerk autonomy ceiling:  $5,000   (500000 cents)
     #   Controller ceiling:         $50,000  (5000000 cents)
     #   GL-confidence floor:        0.7
+    #   Dual sign-off:              above $500,000 (50000000 cents) — the CFO
+    #     signs first, then Poe routes it to the Controller as second signer
+    #     and posts only with both (enforced in agency/erp_poster_agent.py).
     # Anything anomalous or low-confidence escalates at least to the Controller
     # regardless of amount. Bounded back-edge to Ivy on a failed cross-check
     # (match_retry_exhausted counts the round in the session stash); on exhaustion
@@ -425,7 +423,7 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────────
   # Poe — ERP Poster & Ledger Liaison (programmatic FINISHER). Sits BEHIND the
-  # human approval gate. It never approves or pays — it re-checks that a human
+  # human approval step. It never approves or pays — it re-checks that a human
   # actually approved (allow-token allowlist + block-token denylist; an UNKNOWN
   # verdict FAILS CLOSED), enforces deterministic invariants a human can't waive
   # (an invoice on record, a GL account, a positive amount), renders the posting
@@ -433,121 +431,131 @@ agents:
   # ledger entry. After the HITL gate the upstream payload is dropped, so Poe
   # recovers the invoice from the session stash / dev store. See
   # agency/erp_poster_agent.py for the enforce_posting_floor.
+  #
+  # DUAL SIGN-OFF above $500,000: Poe records each approval (which seat, which
+  # person) in the sign-off register. With only the CFO's approval it posts
+  # nothing and routes the entry to the Controller as second signer. It posts
+  # only when both the CFO and the Controller approved and they are two
+  # different people (segregation of duties). Without a CFO approval on record
+  # it blocks.
   # ─────────────────────────────────────────────────────────────────────────
   erp_poster_agent:
     name: erp_poster_agent
     communication_type: chain
     agent_type: programmatic
-    description: "ERP Poster & Ledger Liaison — re-checks approval, posts the approved entry to the ERP, WORM ledger."
+    description: "ERP Poster & Ledger Liaison — re-checks approval (two signers above $500K), posts the approved entry to the ERP, WORM ledger."
     yields:
       approved: "boolean"
       posted: "boolean"
       erp_entry_id: "string"
       pack_path: "string"
-      status: "string"              # posted | blocked
-      block_reasons: "array"
+      status: "string"              # posted | blocked | awaiting_second_signature
+      block_reasons: {type: array, items: string}
+      signed_by: {type: array, items: string}   # approving seats on record, e.g. ["cfo_human", "controller_human"]
+      awaiting_signer: "string"     # controller_human while a >$500K entry waits for its second signature
       invoice_id: "string"
       vendor_name: "string"
       amount_cents: "number"
     can_call:
+      - agent: controller_human
+        condition: "calling_agent_response.status == 'awaiting_second_signature'"
       - agent: audit_logger_agent
-        condition: "always"
+        condition: "calling_agent_response.status != 'awaiting_second_signature'"
 
   # ─────────────────────────────────────────────────────────────────────────
   # Human members — first-class, reached in the channel they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
+  # Nothing is approved or posted on silence. If nobody answers within the
+  # seat's human_timeout_seconds, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nobody is chased
+  # automatically. fallback_on_timeout / fallback_response below declare the
+  # intent (held_for_review -> audit); on leafmesh 2.4.486 a dual seat's
+  # timeout does not route it yet.
   # dual belongs on the human/webhook boundary agent ONLY; the AI specialists
   # above are all `chain` (dual->dual is a footgun the SDK warns on). Humans
   # never call other humans (that would be dual->dual) — tier selection happens
-  # upstream on Mat's approval matrix, and the Manager SUPERVISOR escalates a
-  # held gate to the Finance-Ops Lead (manager.escalation.targets).
+  # upstream on Mat's approval matrix, and the second signer above $500K is
+  # reached through Poe.
   # ─────────────────────────────────────────────────────────────────────────
 
   ap_clerk_human:
     name: ap_clerk_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
-    human_timeout_seconds: 3600     # 1 hour for routine review / a question answer
+    human_timeout_seconds: 14400    # 4 working hours — a routine sign-off or a question is answered the same half-day
     description: "AP Clerk — answers Ivy's targeted questions and signs off routine coding sheets (< $5K)."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     can_call:
       - agent: erp_poster_agent
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
       - agent: invoice_intake_agent
         condition: "calling_agent_response.human_message == 'answered'"
       - agent: audit_logger_agent
-        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'hold' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"       # approve | answered | reject | held_for_review
+      human_message: "string"       # approve | answered | reject | hold | held_for_review
     inputs:
       question: "string"
 
   controller_human:
     name: controller_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
+    # Dual sign-off above $500K needs to know WHO signed. Name the people who
+    # hold this seat (their Studio logins) so the Inbox records the person on
+    # each approval; without it Poe refuses to post above $500K.
+    # operator_ids: ["controller@yourcompany.example"]
     communication_type: dual
-    human_timeout_seconds: 7200     # 2 hours; exception items may sit longer
-    description: "Controller — regulated sign-off for exceptions, $5K-$50K, low-confidence coding, or flagged risk."
+    human_timeout_seconds: 28800    # 8 working hours — one business day
+    description: "Controller — regulated sign-off for exceptions, $5K-$50K, low-confidence coding, or flagged risk; second signer above $500K."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       - agent: erp_poster_agent
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
-      # On silence/hold or a reject, record it and let the Manager SUPERVISOR
-      # escalate to the Finance-Ops Lead — no hardcoded human->human wire.
+      # A reject or a hold is recorded in the audit sink and stops there.
+      # No human->human wire; nobody is chased automatically.
       - agent: audit_logger_agent
-        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'hold' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"       # approve | reject | held_for_review
+      human_message: "string"       # approve | reject | hold | held_for_review
     inputs:
       coding_sheet: "object"
 
   cfo_human:
     name: cfo_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
+    # Dual sign-off above $500K needs to know WHO signed. Name the people who
+    # hold this seat (their Studio logins) so the Inbox records the person on
+    # each approval; without it Poe refuses to post above $500K.
+    # operator_ids: ["cfo@yourcompany.example"]
     communication_type: dual
-    human_timeout_seconds: 14400    # 4 hours
-    description: "CFO — high-value sign-off (>= $50K); dual sign-off policy above $500K."
+    human_timeout_seconds: 86400    # 24 hours — next business day, wherever the CFO is
+    description: "CFO — high-value sign-off (>= $50K); first of two signers above $500K (the Controller signs second)."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       - agent: erp_poster_agent
         condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
       - agent: audit_logger_agent
-        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'rejected' or calling_agent_response.human_message == 'hold' or calling_agent_response.human_message == 'held_for_review'"
     yields:
-      human_message: "string"       # approve | reject | held_for_review
+      human_message: "string"       # approve | reject | hold | held_for_review
     inputs:
       coding_sheet: "object"
 
   finance_ops_lead_human:
     name: finance_ops_lead_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
     human_timeout_seconds: 259200   # 3 days
     description: "Accountable owner — reviews exceptions, owns policy calls, decides every gate. Everything that leaves the pod."
@@ -555,10 +563,6 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     can_call:
       - agent: audit_logger_agent
         condition: "always"
@@ -575,7 +579,7 @@ agents:
     name: audit_logger_agent
     agent_type: external
     framework: custom
-    communication_type: execute
+    communication_type: chain
     description: "WORM audit — hash-chains every decision, post, approval, and held gate. Terminus."
     connector_config:
       sink_type: local_file
