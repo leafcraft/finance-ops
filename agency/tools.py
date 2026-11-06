@@ -5,12 +5,13 @@ an invoice and its context. Each reads the seeded source store so the pod runs
 with no connector wired, and **each announces itself**: when there is no real
 source and no seed, it returns `available: false` and says why — never a
 synthetic success that looks like a real read. To go live, wire the ERP / mail
-mcp block in config.yaml (each named action becomes its own tool); these dev
+mcp block in the configuration (each named action becomes its own tool); these dev
 tools are the fallback contract.
 """
 import os
 
-from leafmesh import global_tool, LeafMeshLogger
+from leafmesh import connection_rows, global_tool, LeafMeshLogger
+from leafmesh.vault.refs import UnresolvedVaultRef
 
 try:
     from ._shared import store
@@ -22,13 +23,26 @@ except ImportError:  # pragma: no cover — direct-run fallback
 logger = LeafMeshLogger(__name__)
 
 
-def _connector_wired() -> bool:
-    """True if a real invoice connector is configured (ERP/mail mcp URL set)."""
-    return bool(os.getenv("ERP_MCP_URL") or os.getenv("MAIL_MCP_URL"))
+async def _vault_record_exists(name: str) -> bool:
+    """True when the vault holds a record called `name` (Studio → Infrastructure).
+    The record existing is the "real connector is wired" signal; its address
+    and token stay in the vault and are never read here."""
+    try:
+        await connection_rows(name)
+        return True
+    except UnresolvedVaultRef:
+        return False
+    except PermissionError:  # SecretNotAllowed: the record exists; it only limits which agents read it
+        return True
+
+
+async def _connector_wired() -> bool:
+    """True if a real invoice connector is set up (vault record 'erp_mcp' or 'mail_mcp')."""
+    return await _vault_record_exists("erp_mcp") or await _vault_record_exists("mail_mcp")
 
 
 @global_tool(category="intake")
-def read_invoice_sources(source_ref: str) -> dict:
+async def read_invoice_sources(source_ref: str) -> dict:
     """Read one invoice from the source systems (email / portal / ERP webhook).
 
     Returns the invoice header + line-items, or `available: false` with a reason
@@ -40,11 +54,13 @@ def read_invoice_sources(source_ref: str) -> dict:
     """
     inv = store.find_invoice(str(source_ref).strip())
     if not inv:
-        if _connector_wired():
+        if await _connector_wired():
             return {"available": False,
-                    "reason": "connector wired but returned nothing for this reference"}
+                    "reason": "not in the seed store — read it with the erp_/mail_ MCP tools"}
         return {"available": False,
-                "reason": f"no seed invoice for {source_ref!r}; wire ERP_MCP_URL / MAIL_MCP_URL"}
+                "reason": (f"no seed invoice for {source_ref!r}; to read real invoices create "
+                           "vault record 'erp_mcp' or 'mail_mcp' on Infrastructure → "
+                           "Integrations → MCP and uncomment the mcp block")}
     logger.info(f"read_invoice_sources ref={source_ref} invoice={inv.get('invoice_id')}")
     return {"available": True, **inv}
 
@@ -79,7 +95,7 @@ def list_prior_invoices(vendor_id: str) -> dict:
 def claim_next_invoice() -> dict:
     """Atomically claim ONE unclaimed invoice from the month-end close backlog.
 
-    Each parallel copy of Ivy (see `instances` in config.yaml) calls this to pull
+    Each parallel copy of Ivy (see `scaling.copies` in the configuration) calls this to pull
     a DISJOINT invoice — no two copies get the same one. Returns
     `available: false` when the backlog is drained (a real, distinct outcome —
     not an empty invoice).

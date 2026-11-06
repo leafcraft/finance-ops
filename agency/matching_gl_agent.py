@@ -13,7 +13,7 @@ from Ivy (reader != coder).
     specific discrepancy — a BOUNDED back-edge (match_retry_exhausted counts the
     round in the session stash) — NEVER adjust a number to make it balance.
 A clean, tied-out entry renders the coding sheet to ./out and is stashed for the
-finisher to recover after the human approval gate.
+finisher to recover after the human approval step.
 """
 from __future__ import annotations
 

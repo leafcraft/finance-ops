@@ -1,7 +1,7 @@
 """Ivy — Invoice Intake & Extraction Analyst.
 
 auto_discover matches `invoice_intake_agent` to the YAML agent. Ivy (an llm +
-super_agent, fanned by `instances`) reads an invoice through her tools and
+super_agent, fanned by `scaling.copies`) reads an invoice through her tools and
 produces confidence-scored line-items. The MODEL decides and pulls; this CODE
 fails closed.
 
@@ -10,14 +10,24 @@ a field the model scored low, or a line-item missing an amount, can NEVER be
 passed downstream as "clean". If anything is uncertain, the extract is forced
 un-clean and turned into a question for the AP clerk — a guessed number never
 reaches Mat's coding sheet. The floor also RE-ASSERTS the anomaly-risk policy
-flags (>=$10K / round-thousand / unresolved vendor): the model may raise them,
-never lower them.
+flags (>=$10K / round-thousand / unresolved vendor / a possible re-submission
+of an already-posted invoice): the model may raise them, never lower them. The
+last one makes sure every possible duplicate reaches Ray's dedupe floor, whatever
+its amount.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from leafmesh import LeafMeshLogger, chain
+
+try:
+    from ._shared import store
+except ImportError:  # pragma: no cover
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _shared import store  # type: ignore
 
 logger = LeafMeshLogger(__name__)
 
@@ -31,6 +41,23 @@ def _to_int(v: Any) -> int:
         return int(v or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _looks_already_posted(result: dict, amount_cents: int) -> bool:
+    """Same vendor + same invoice number, or same vendor + amount + due date,
+    already in the posted ledger. Ray decides; this only makes sure he sees it."""
+    vendor_id = str(result.get("vendor_id") or "").strip()
+    if not vendor_id:
+        return False
+    inv_id = str(result.get("invoice_id") or "").strip()
+    due = str(result.get("due_date") or "").strip()
+    for row in store.posted_for_vendor(vendor_id):
+        if inv_id and row.get("invoice_id") == inv_id:
+            return True
+        if amount_cents and due and int(row.get("amount_cents") or 0) == amount_cents \
+                and row.get("due_date") == due:
+            return True
+    return False
 
 
 def enforce_intake_floor(result: Any, context: dict) -> dict:
@@ -62,6 +89,8 @@ def enforce_intake_floor(result: Any, context: dict) -> dict:
         anomaly = True
     if not str(result.get("vendor_id") or "").strip():
         anomaly = True
+    if _looks_already_posted(result, amount_cents):
+        anomaly = True   # possible re-submission -> Ray's dedupe floor decides
     result["anomaly_risk"] = anomaly
 
     if low_conf:

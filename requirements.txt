@@ -2,13 +2,12 @@
 #
 # Core LeafMesh installs everywhere (all LLM providers included) and runs the
 # pod DAY-0 against the seed source store — no connector needed.
-leafmesh>=2.4.131
+leafmesh>=2.4.502
 python-dotenv>=1.0
 apscheduler>=3.10        # required for the daily_close_sweep wake_up cron to fire
-PyYAML>=6.0              # used by validate_config.py
 
 # ── Optional, per what you wire ──────────────────────────────────────────────
-# To connect a real ERP / mailbox (Tier 2 — the mcp block in configs/config.yaml):
+# To connect a real ERP / mailbox (Tier 2 — the mcp block, turned on in Studio):
 #     pip install 'leafmesh[mcp]>=2.4.131'
 #
 # For every channel/listener/knowledge/storage backend at once:

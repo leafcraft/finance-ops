@@ -1,13 +1,14 @@
 # finance-ops — example scenarios
 
-Five realistic scenarios that exercise the major paths through the pod. Each file
+Six realistic scenarios that exercise the major paths through the pod. Each file
 is a self-contained JSON (`_entry_point` + `_description` + `data`) that runs
 end-to-end via `mesh_call` against the seed source store — no connector needed.
 
 ## How to run
 
 ```bash
-# All five scenarios in sequence:
+create-leafmesh --load .   # once: loads the team into the Redis in .env (or use create-leafmesh --start .)
+# All six scenarios in sequence:
 python examples/run_examples.py
 
 # One specific scenario (any substring match works):
@@ -28,7 +29,8 @@ runs.
 | 2 | Duplicate re-submission | `email_invoice` | Ray's **dedupe floor** catches an already-posted invoice → forced controller review (not paid twice) |
 | 3 | 3-way quantity variance | `portal_invoice` | Mat's **3-way match floor** finds a short goods receipt → cross-check fails → bounded back-edge to Ivy → Lead |
 | 4 | "Where is this invoice?" | `invoice_status` | Cora answers stage / waiting-on from the case record, inventing nothing |
-| 5 | Month-end close sweep | `daily_close_sweep` | Ivy fans across the backlog via `instances` — each copy claims a **disjoint** invoice atomically |
+| 5 | Month-end close sweep | `daily_close_sweep` | Ivy fans across the backlog via `scaling.copies` — each copy claims a **disjoint** invoice atomically |
+| 6 | Dual sign-off ($642,500) | `portal_invoice` | Above $500K: **CFO approves → Poe routes to the Controller → posts only with both signatures** (two different people) |
 
 ## Why these scenarios
 
@@ -44,5 +46,5 @@ runs.
 
 These run the full LLM chain (Tier 1: license + API keys + Redis). The finisher
 and floor guarantees are also covered without any LLM/Redis in
-`tests/test_floors.py`. Add a `06_*.json` and the runner picks it up
+`tests/test_floors.py`. Add a `07_*.json` and the runner picks it up
 automatically.
