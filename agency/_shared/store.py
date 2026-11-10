@@ -119,6 +119,16 @@ _SEED_VENDORS: dict[str, Any] = {
         "requires_po": True, "requires_3way": False,
         "historical_median_cents": 25000000, "paid_invoice_count": 3,
     },
+    # Capex contractor — the warehouse fit-out above the $500K dual sign-off line.
+    "v-kestrel-facilities-009": {
+        "vendor_id": "v-kestrel-facilities-009",
+        "vendor_name": "Kestrel Facilities Group LLC",
+        "country_code": "US", "status": "active", "first_seen": "2021-04-07",
+        "default_gl_account": "1500-Equipment",
+        "default_cost_center": "CC-OPS", "payment_terms": "Net60",
+        "requires_po": True, "requires_3way": True,
+        "historical_median_cents": 18500000, "paid_invoice_count": 9,
+    },
 }
 
 # Purchase orders — po_number → record. `goods_receipt` is the third leg
@@ -155,9 +165,12 @@ _SEED_POS: dict[str, Any] = {
         "currency": "USD",
         "lines": [
             {"sku": "ADVISORY-DAY", "description": "Advisory engagement, daily",
-             "quantity": 8, "unit_price_cents": 60000},
+             "quantity": 16, "unit_price_cents": 500000},
         ],
-        "goods_receipt": None,   # services — no goods receipt
+        # Services have no goods receipt; the budget owner's service entry
+        # sheet (16 days accepted) is the third leg of the match.
+        "goods_receipt": {"receipt_id": "SES-77700", "received_at": "2026-06-26",
+                          "lines": [{"sku": "ADVISORY-DAY", "quantity": 16}]},
     },
     # ── POs referenced by the examples/ scenarios ──
     # Happy path (example 01) — matches the invoiced line cleanly.
@@ -199,6 +212,22 @@ _SEED_POS: dict[str, Any] = {
                           "lines": [{"sku": "DW-LICENCE", "quantity": 1},
                                     {"sku": "PREMIUM-SUPPORT", "quantity": 1}]},
     },
+    # Dual sign-off (example 06) — $642,500 warehouse fit-out, above $500K.
+    "PO-2026-0210": {
+        "po_number": "PO-2026-0210", "vendor_id": "v-kestrel-facilities-009",
+        "status": "open", "currency": "USD",
+        "lines": [
+            {"sku": "RACK-INSTALL",
+             "description": "Pallet racking supply and install — Building C",
+             "quantity": 1, "unit_price_cents": 51200000},
+            {"sku": "ELEC-FITOUT",
+             "description": "Warehouse electrical fit-out — Building C",
+             "quantity": 1, "unit_price_cents": 13050000},
+        ],
+        "goods_receipt": {"receipt_id": "GR-0210", "received_at": "2026-06-20",
+                          "lines": [{"sku": "RACK-INSTALL", "quantity": 1},
+                                    {"sku": "ELEC-FITOUT", "quantity": 1}]},
+    },
 }
 
 # Chart of accounts — the GL-validity floor rejects any code NOT in here.
@@ -216,32 +245,90 @@ _SEED_GL_CHART: dict[str, Any] = {
 }
 
 # Sample invoices keyed by source_event_id — the demo / examples ingest
-# these. Amounts chosen to exercise each approval tier + the dup/3-way
-# floors. (One is a deliberate re-submission of inv-acme-2207.)
+# these. Amounts chosen to exercise each approval tier (AP clerk < $5K,
+# Controller $5K–$50K, CFO >= $50K, CFO + Controller above $500K) and each
+# floor (duplicate, missing PO, PO quantity mismatch, 3-way receipt short).
+# Line totals sum to amount_cents; every PO-backed line carries its PO sku.
 _SEED_INVOICES: dict[str, Any] = {
+    # Duplicate: a re-submission of an invoice already posted on 2026-06-15.
     "evt-acme-2207": {
         "source_event_id": "evt-acme-2207", "invoice_id": "inv-acme-2207",
         "source": "email", "vendor_id": "v-acme-001",
         "vendor_name": "Acme Supplies", "amount_cents": 250000,
         "currency": "USD", "po_number": "PO-12345", "due_date": "2026-07-15",
-        "line_items": [{"description": "Annual SaaS subscription seat",
+        "line_items": [{"sku": "SAAS-SEAT", "description": "Annual SaaS subscription seat",
                         "quantity": 10, "unit_price": 250, "total": 2500}],
     },
+    # Missing data: Acme requires a PO and none is cited; no due date printed.
+    "evt-acme-2291": {
+        "source_event_id": "evt-acme-2291", "invoice_id": "inv-acme-2291",
+        "source": "email", "vendor_id": "v-acme-001",
+        "vendor_name": "Acme Supplies", "amount_cents": 98000,
+        "currency": "USD", "po_number": "", "due_date": "",
+        "line_items": [{"sku": "SAAS-SEAT", "description": "Additional SaaS seat — prorated Jul–Dec",
+                        "quantity": 4, "unit_price": 245, "total": 980}],
+    },
+    # 3-way variance: billed 100 pallets, goods receipt shows 92.
     "evt-globex-9001": {
         "source_event_id": "evt-globex-9001", "invoice_id": "inv-globex-9001",
         "source": "portal", "vendor_id": "v-globex-002",
         "vendor_name": "Globex Logistics", "amount_cents": 1200000,
-        "currency": "USD", "po_number": "PO-55500", "due_date": "2026-07-20",
-        "line_items": [{"description": "Pallet freight, zone 4",
+        "currency": "USD", "po_number": "PO-55500", "due_date": "2026-07-27",
+        "line_items": [{"sku": "FREIGHT-PALLET", "description": "Pallet freight, zone 4",
                         "quantity": 100, "unit_price": 120, "total": 12000}],
     },
+    # CFO tier: 16 advisory days at $5,000 = $80,000.
     "evt-initech-4410": {
         "source_event_id": "evt-initech-4410", "invoice_id": "inv-initech-4410",
         "source": "manual", "vendor_id": "v-initech-003",
         "vendor_name": "Initech Consulting", "amount_cents": 8000000,
-        "currency": "USD", "po_number": "PO-77700", "due_date": "2026-08-01",
-        "line_items": [{"description": "Advisory engagement",
-                        "quantity": 8, "unit_price": 6000, "total": 48000}],
+        "currency": "USD", "po_number": "PO-77700", "due_date": "2026-07-30",
+        "line_items": [{"sku": "ADVISORY-DAY", "description": "Advisory engagement, daily",
+                        "quantity": 16, "unit_price": 5000, "total": 80000}],
+    },
+    # Happy path, AP clerk tier: $4,200, matches its PO line for line.
+    "evt-acmecloud-0142": {
+        "source_event_id": "evt-acmecloud-0142", "invoice_id": "inv-acmecloud-0142",
+        "source": "email", "vendor_id": "v-acme-cloud-001",
+        "vendor_name": "Acme Cloud Services Inc.", "amount_cents": 420000,
+        "currency": "USD", "po_number": "PO-2026-0142", "due_date": "2026-07-01",
+        "line_items": [{"sku": "ENTERPRISE-TIER",
+                        "description": "Enterprise tier — June 2026 subscription",
+                        "quantity": 1, "unit_price": 4200, "total": 4200}],
+    },
+    # PO quantity mismatch: PO authorised 10 desks, invoice bills 12.
+    "evt-quint-0099": {
+        "source_event_id": "evt-quint-0099", "invoice_id": "inv-quint-0099",
+        "source": "portal", "vendor_id": "v-quintessential-office-007",
+        "vendor_name": "Quintessential Office Supplies Co.", "amount_cents": 144000,
+        "currency": "USD", "po_number": "PO-2026-0099", "due_date": "2026-06-27",
+        "line_items": [{"sku": "EDX-450", "description": "Ergonomic desk — model EDX-450",
+                        "quantity": 12, "unit_price": 120, "total": 1440}],
+    },
+    # CFO tier, two lines: $230,000 licence + $20,000 support = $250,000.
+    "evt-snowmelt-0007": {
+        "source_event_id": "evt-snowmelt-0007", "invoice_id": "inv-snowmelt-0007",
+        "source": "erp_webhook", "vendor_id": "v-snowmelt-data-platform-001",
+        "vendor_name": "SnowMelt Data Platform Inc.", "amount_cents": 25000000,
+        "currency": "USD", "po_number": "PO-2026-0007", "due_date": "2026-07-02",
+        "line_items": [
+            {"sku": "DW-LICENCE",
+             "description": "Enterprise data warehouse — annual licence, 4 environments",
+             "quantity": 1, "unit_price": 230000, "total": 230000},
+            {"sku": "PREMIUM-SUPPORT", "description": "Premium support — 24×7 SLA, named TAM",
+             "quantity": 1, "unit_price": 20000, "total": 20000}],
+    },
+    # Dual sign-off: $512,000 + $130,500 = $642,500 — CFO, then Controller.
+    "evt-kestrel-0210": {
+        "source_event_id": "evt-kestrel-0210", "invoice_id": "inv-kestrel-0210",
+        "source": "portal", "vendor_id": "v-kestrel-facilities-009",
+        "vendor_name": "Kestrel Facilities Group LLC", "amount_cents": 64250000,
+        "currency": "USD", "po_number": "PO-2026-0210", "due_date": "2026-08-19",
+        "line_items": [
+            {"sku": "RACK-INSTALL", "description": "Pallet racking supply and install — Building C",
+             "quantity": 1, "unit_price": 512000, "total": 512000},
+            {"sku": "ELEC-FITOUT", "description": "Warehouse electrical fit-out — Building C",
+             "quantity": 1, "unit_price": 130500, "total": 130500}],
     },
 }
 
@@ -343,9 +430,9 @@ def find_invoice(ref: str) -> dict[str, Any]:
     return {}
 
 
-# ── Backlog claim (the atomic claim behind Ivy's `instances` fan-out) ────────
+# ── Backlog claim (the atomic claim behind Ivy's `scaling.copies` fan-out) ──
 # Dev is single-process, so a threading lock guarding an in-memory claimed set
-# IS the atomic claim (each parallel instance pops a DISJOINT invoice). PROD:
+# IS the atomic claim (each parallel copy pops a DISJOINT invoice). PROD:
 # swap the body for `LPOP count` on a Redis list, or `UPDATE ... FOR UPDATE SKIP
 # LOCKED RETURNING` on the ERP's unposted-invoice table — the contract (one
 # caller gets each item, exactly once) is unchanged.
@@ -414,3 +501,37 @@ def record_posted(row: dict[str, Any]) -> None:
             "posted_at_utc": str(row.get("posted_at_utc") or _now()),
         })
         _save("posted_ledger", s)
+
+
+# ── Sign-off register (dual sign-off above $500K) ────────────────────
+# One row per approval: which seat approved, which person, when. Kept in the
+# dev store (not the session) so a restart between the two signatures loses
+# nothing. PROD: the ERP's approval history / your approval workflow table.
+def record_signoff(invoice_id: str, seat: str, operator_id: str = "") -> list[dict[str, Any]]:
+    """Record one approval of `invoice_id` and return every approval on record.
+    The same seat + person approving twice is recorded once."""
+    if not invoice_id:
+        return []
+    with _LOCK:
+        s = _load("signoffs")
+        rows = s.setdefault(invoice_id, [])
+        if seat and not any(r.get("seat") == seat and r.get("operator_id") == operator_id
+                            for r in rows):
+            rows.append({"seat": seat, "operator_id": operator_id, "approved_at_utc": _now()})
+            _save("signoffs", s)
+        return list(rows)
+
+
+def clear_signoffs(invoice_id: str) -> None:
+    """A rejection or hold voids every earlier approval of `invoice_id`: the
+    next approval round starts from no signatures."""
+    if not invoice_id:
+        return
+    with _LOCK:
+        s = _load("signoffs")
+        if s.pop(invoice_id, None) is not None:
+            _save("signoffs", s)
+
+
+def signoffs_for(invoice_id: str) -> list[dict[str, Any]]:
+    return list(_load("signoffs").get(invoice_id, []))

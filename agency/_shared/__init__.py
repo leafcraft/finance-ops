@@ -9,6 +9,6 @@ implementations the YAML references:
 They are imported from main.py BEFORE leafmesh.start() so they
 register under name "custom" before agent registration.
 
-Auto-discovery in configs/config.yaml has `recursive: false`, so this
+Auto-discovery in the configuration has `recursive: false`, so this
 sub-package is intentionally excluded from agent discovery.
 """

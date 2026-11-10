@@ -1,6 +1,6 @@
 """finance-ops — agency package.
 
-YAML-FIRST: most agents are pure YAML (configs/config.yaml) — LLM agents
+YAML-FIRST: most agents are pure YAML (the configuration) — LLM agents
 get structured output derived from their yields:, and programmatic
 system-of-record agents are connector-only (integration + connector_config).
 The few modules here exist only where Python MUST be:

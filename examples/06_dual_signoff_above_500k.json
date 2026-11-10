@@ -1,0 +1,8 @@
+{
+  "_entry_point": "portal_invoice",
+  "_description": "Kestrel Facilities bills $642,500 for the Building C warehouse fit-out (two lines, PO-2026-0210, goods received). Above $500K: the CFO approves first, Poe records it and routes the entry to the Controller as second signer, and posts only after both have approved — two different people.",
+  "data": {
+    "source_ref": "evt-kestrel-0210",
+    "message": "Final invoice for the Building C racking and electrical fit-out."
+  }
+}
