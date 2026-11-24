@@ -42,10 +42,10 @@ model's mood. **Mat cross-checks** before anyone sees the sheet and returns to I
 on a mismatch (bounded — one round, then it terminates to the Lead) rather than
 balancing the books itself. **Poe re-checks that a human actually approved**
 before it posts anything, and **deletes a half-posted pack** if its floor trips.
-**Silence never advances an invoice.** If nobody answers a gate within its reply
-window, the request waits no longer: its Inbox card closes and the ticket records
-that no reply came. Nothing is approved or posted on silence, and nobody is
-chased automatically. **Above $500K two people sign** — Poe records the CFO's
+**Silence never advances an invoice.** If nobody answers within its reply
+window, the seat's default reply, `hold`, goes through its routes like any reply
+and is recorded in the audit log. Nothing is approved or posted on silence, and
+nobody is chased automatically. **Above $500K two people sign** — Poe records the CFO's
 approval, routes the entry to the Controller, and posts only with both
 signatures from two different, identified people. Name each seat's people
 (`operator_ids` on `cfo_human` and `controller_human`, their Studio logins) so
@@ -59,21 +59,28 @@ the money moves, and month-end close stops being a fire drill.
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `fin_coordinator_agent` | Finance-Ops Coordinator | Owns the case end to end; opens it, keeps live status, is the requester's one contact | LLM; orchestrates Ivy→Ray→Mat→Poe; routes exceptions to the Lead; **never extracts, codes, or approves** |
+| `fin_coordinator_agent` | Finance-Ops Coordinator | Owns the case end to end; opens it, keeps live status, is the requester's one contact | LLM + **playbook** (`open_case`, `status`, `escalate`); orchestrates Ivy→Ray→Mat→Poe; routes exceptions to the Lead; **never extracts, codes, or approves** |
 | `invoice_intake_agent` | Invoice Intake & Extraction Analyst | Reads each invoice with a confidence score, classifies AP/AR/close, runs the policy pre-check | LLM + **super_agent** + **playbook** (AP/AR/close lanes) + **scaling.copies** (3 copies, backlog fan-out with an atomic claim tool) + intake tools; `@chain` **confidence floor** (fail closed) |
-| `payment_risk_agent` | Payment-Risk Officer | Duplicate ledger pre-flight + fraud/anomaly verdict from vendor history | LLM; `@chain` **dedupe floor** — a confirmed duplicate is forced to controller review |
+| `payment_risk_agent` | Payment-Risk Officer | Duplicate ledger pre-flight + fraud/anomaly verdict from vendor history | LLM + **playbook** (`duplicate_check`, `fraud_verdict`, `controller_briefing`); `@chain` **dedupe floor** — a confirmed duplicate is forced to controller review |
 | `matching_gl_agent` | Matching & GL-Coding Builder | PO/3-way match + GL coding; cross-checks totals tie out; renders the coding sheet | LLM + **playbook**; `@chain` **cross-check floor**; bounded back-edge to Ivy; renders the draft to `./out`; approval matrix on its wires |
 | `erp_poster_agent` | ERP Poster & Ledger Liaison | Re-checks approval, posts the approved entry to the ERP, records the ledger | Programmatic **finisher**; approve-token re-check → invariants → post + render pack → **delete-on-block** → WORM ledger |
-| `finance_ops_lead_human` | Accountable owner (Human) | Reviews exceptions, owns policy calls, decides every gate | Human gate — everything that leaves the pod |
-| `ap_clerk_human` | AP Clerk (Human) | Answers Ivy's questions; signs off routine coding sheets (< $5K) | Human gate |
-| `controller_human` | Controller (Human) | Regulated sign-off for exceptions, $5K–$50K, low-confidence coding, flagged risk; second signer above $500K | Human gate |
-| `cfo_human` | CFO (Human) | High-value sign-off (≥ $50K); first of two signers above $500K (enforced by Poe) | Human gate |
+| `finance_ops_lead_human` | Accountable owner (Human) | Reviews exceptions, owns policy calls, makes every final call | Human step — everything that leaves the pod |
+| `ap_clerk_human` | AP Clerk (Human) | Answers Ivy's questions; signs off routine coding sheets (< $5K) | Human member |
+| `controller_human` | Controller (Human) | Regulated sign-off for exceptions, $5K–$50K, low-confidence coding, flagged risk; second signer above $500K | Human member |
+| `cfo_human` | CFO (Human) | High-value sign-off (≥ $50K); first of two signers above $500K (enforced by Poe) | Human member |
 | `audit_logger_agent` | WORM audit | Hash-chains every decision, post, approval, and held gate | External (custom sink); terminus |
 
 Reply windows (`human_timeout_seconds`): AP Clerk 4 working hours, Controller
 8 working hours (one business day), CFO 24 hours, Finance-Ops Lead 3 days. When a
-window passes with no answer, the Inbox card closes and the ticket records that
-no reply came; nothing is approved, posted or escalated on silence.
+window passes with no answer, the seat's default reply (`hold`) goes to the audit
+log; nothing is approved, posted or escalated on silence.
+
+The Inbox has no buttons. Each person types a reply, and a small reply reader
+(`gpt-4o-mini`) turns it into a `verdict`: `approve`, `reject` or `hold` on the
+three approval seats, `hold` on the Finance-Ops Lead. Anything that is not a
+clear yes reads as `hold`. If the person answered an agent's question instead
+of deciding, the verdict is `answer` and it goes back to only the agent that
+asked.
 
 The **LeafMesh Manager** supervises. It escalates to the Finance-Ops Lead when an
 agent fails with an error a retry cannot fix (auth, bad request, credit, bad
@@ -97,7 +104,7 @@ stand-ins that **announce themselves** until you wire Tier 2.
 ### Tier 1 — required to boot (dev mode)
 | Setting | For | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `ANTHROPIC_API_KEY` | Ivy + Mat (Claude) | **Required.** |
 | `OPENAI_API_KEY` | Cora + Ray + Manager (`gpt-4o-mini`) | **Required** unless you change the models. |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |

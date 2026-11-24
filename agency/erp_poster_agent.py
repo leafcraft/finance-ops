@@ -12,7 +12,7 @@ concrete "@chain fails closed":
   c) post the entry + render the posting pack to ./out; on a tripped floor,
      DELETE the partial and record `status: blocked` with reasons — never a
      half-posted entry.
-  d) dev-store recovery — after the HITL gate the upstream payload is dropped,
+  d) dev-store recovery — after the human step the upstream payload is dropped,
      so Poe recovers the coded invoice from the session stash / dev store.
   e) DUAL SIGN-OFF above $500,000 (DUAL_SIGNOFF_CENTS). Each approval is
      recorded in the sign-off register (store.record_signoff: which seat, which
@@ -63,7 +63,7 @@ def _signal(input_data: dict) -> str:
         sources.extend(v for v in up.values() if isinstance(v, dict))
         sources.append(up)
     for src in sources:
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()

@@ -6,7 +6,7 @@ with ONLY the human-response meta fields (human_message, human_decision,
 re-delivered to the next agent. gl_coding_agent (the last pre-gate
 agent) stashes the full invoice + GL context here, keyed by
 session_id, so erp_poster (and the audit sink) can recover it after
-the human gate.
+the human step.
 
 In-process only — survives the human wait because the mesh is one
 process. A multi-replica deployment swaps this for the Redis session

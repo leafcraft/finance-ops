@@ -56,16 +56,16 @@
         ├── < $5K, conf >= 0.7, no anomaly ────────► AP Clerk
         ├── < $50K, or >= $5K / low-conf / anomaly ► Controller
         └── >= $50K ───────────────────────────────► CFO
-                                                       │ human_message == approve
+                                                       │ verdict == approve
                                                        ▼
    Poe — ERP Poster & Ledger Liaison (programmatic FINISHER)
         │   @chain posting floor — approve-token re-check → invariants → dual sign-off → post → render → delete-on-block
         ├── > $500K with only the CFO's approval ──► Controller (second signer) ─ approve ─► Poe
         └── otherwise (posted / blocked) ──────────► audit_logger (WORM terminus)
 
-   every human gate: reject / hold → audit_logger. No answer within the reply
-   window → the Inbox card closes and the ticket records that no reply came;
-   nothing is approved or posted.
+   every human step: reject / hold → audit_logger; answer → back to the agent
+   that asked. No answer within the reply window → the default reply (hold)
+   → audit_logger; nothing is approved or posted.
 ```
 
 One human, one agent, one system per stage: **the agent produces, the human
@@ -126,12 +126,13 @@ it is pulled by the agent that operates them.
   readable in the configuration, never hidden in Python.
 - **Nothing moves on silence** — a reject or hold goes to the audit sink. If
   nobody answers within the reply window (AP Clerk 4 h, Controller 8 h, CFO
-  24 h, Lead 3 days), the Inbox card closes and the ticket records that no
-  reply came; nobody is chased automatically. `fallback_on_timeout` +
-  `fallback_response → held_for_review` stay in the config as the declared
-  intent; on leafmesh 2.4.486 a dual seat's timeout does not route it yet.
-- **`dual` only on the human boundary** — the AI specialists are all `chain`
-  (dual→dual is a warned footgun). Humans never call other humans; tier selection
+  24 h, Lead 3 days), `fallback_on_timeout` + `fallback_response`
+  (`verdict: hold`, `held_for_review`) goes through the seat's routes like any
+  reply and lands in the audit sink; nobody is chased automatically.
+- **Person seats read typed replies** — every agent is `chain`; each person
+  seat has a `reply_reader` (`gpt-4o-mini`) that turns the Inbox reply into a
+  `verdict`, and its routes read `verdict`. `answer` goes back to only the
+  agent that asked. Humans never call other humans; tier selection
   happens on Mat's matrix, and the second signer above $500K is reached through
   Poe. The Manager escalates errors only (a non-retryable error, 5 failed agents
   in a session, restarts used up).
